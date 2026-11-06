@@ -1,0 +1,550 @@
+import os
+import re
+import glob
+import logging
+from datetime import datetime
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import xlrd
+import requests
+import gdown
+
+# --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables / GitHub Secrets) ---
+DEFAULT_DRIVE_FOLDER = "https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing"
+GDRIVE_FOLDER_URL = os.environ.get("GDRIVE_FOLDER_URL", DEFAULT_DRIVE_FOLDER)
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def download_drive_folder(folder_url=GDRIVE_FOLDER_URL, output_dir="downloads"):
+    """ดาวน์โหลดไฟล์ทั้งหมดจาก Google Drive Folder สาธารณะ"""
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"กำลังดาวน์โหลดไฟล์จาก Google Drive: {folder_url}")
+    try:
+        downloaded = gdown.download_folder(
+            folder_url,
+            output=output_dir,
+            quiet=False,
+            use_cookies=False,
+            remaining_ok=True
+        )
+        logger.info(f"ดาวน์โหลดสำเร็จ ได้รับไฟล์: {downloaded}")
+        return output_dir
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการดาวน์โหลดด้วย gdown: {e}")
+        return output_dir
+
+
+def find_target_files(search_dirs=None):
+    """
+    ค้นหาไฟล์ Report ล่าสุด และไฟล์ Master (เช่น 5-11.xls)
+    โดยรองรับการเปลี่ยนชื่อไฟล์ทุกวันอัตโนมัติ
+    """
+    if search_dirs is None:
+        search_dirs = ["downloads", "."]
+
+    all_files = []
+    for d in search_dirs:
+        if os.path.exists(d):
+            for f in os.listdir(d):
+                fp = os.path.join(d, f)
+                if os.path.isfile(fp):
+                    name_lower = f.lower()
+                    if name_lower.endswith((".xlsx", ".xls")) and not f.startswith("~$") and not name_lower.startswith("match_result"):
+                        all_files.append(fp)
+
+    if not all_files:
+        raise FileNotFoundError("ไม่พบไฟล์ Excel ในโฟลเดอร์สำหรับประมวลผล")
+
+    # แยกไฟล์ Report และไฟล์ Master
+    report_candidates = [f for f in all_files if "report" in os.path.basename(f).lower()]
+    master_candidates = [f for f in all_files if "report" not in os.path.basename(f).lower()]
+
+    if not report_candidates:
+        raise FileNotFoundError("ไม่พบไฟล์ประเภท Report_*.xlsx")
+    if not master_candidates:
+        raise FileNotFoundError("ไม่พบไฟล์ประเภท Master (เช่น 5-11.xls)")
+
+    # เลือกไฟล์ล่าสุดตามเวลาแก้ไข (หรือชื่อไฟล์)
+    latest_report = max(report_candidates, key=os.path.getmtime)
+    latest_master = max(master_candidates, key=os.path.getmtime)
+
+    logger.info(f"ไฟล์ Report ที่เลือก: {latest_report}")
+    logger.info(f"ไฟล์ Master ที่เลือก: {latest_master}")
+    return latest_report, latest_master
+
+
+def normalize_doc_no(val):
+    """แปลงค่ารหัสเอกสารให้เป็นมาตรฐาน PJXXXXXXX"""
+    if val is None:
+        return ""
+    val_str = str(val).strip()
+    if not val_str or val_str.lower() in ("nan", "none", "-"):
+        return ""
+
+    # ค้นหา PJ ตามด้วยตัวเลข เช่น PJ1547564
+    match_pj = re.search(r"PJ\s*(\d+)", val_str, re.IGNORECASE)
+    if match_pj:
+        return f"PJ{match_pj.group(1)}"
+
+    # ถ้าเป็นตัวเลขล้วน (เช่น 1547564 หรือ 1547563 0091213) ดึงเลข 6-8 หลักแรก
+    match_num = re.search(r"\b(\d{6,8})\b", val_str)
+    if match_num:
+        return f"PJ{match_num.group(1)}"
+
+    # กรณีเลขทั่วไป
+    match_any_num = re.search(r"(\d+)", val_str)
+    if match_any_num and len(match_any_num.group(1)) >= 4:
+        return f"PJ{match_any_num.group(1)}"
+
+    return val_str
+
+
+def parse_amount(val):
+    """แปลงค่ายอดเงินเป็น float ปลอดภัย"""
+    if val is None or pd.isna(val):
+        return 0.0
+    val_str = str(val).replace(",", "").replace(" ", "").strip()
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
+
+
+def read_report_file(filepath):
+    """
+    อ่านไฟล์ Report_*.xlsx
+    สกัด: วันเวลา, รหัสรายการ, ยอดเงิน (Col D), หมายเหตุ (Col I)
+    """
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    ws = wb.active
+
+    rows_data = []
+    for r in range(2, ws.max_row + 1):
+        time_val = ws.cell(r, 1).value
+        code_val = ws.cell(r, 2).value
+        type_val = ws.cell(r, 3).value
+        amount_val = ws.cell(r, 4).value
+        status_val = ws.cell(r, 8).value
+        note_val = ws.cell(r, 9).value
+
+        # กรองแถวว่าง
+        if time_val is None and code_val is None and amount_val is None and note_val is None:
+            continue
+
+        # กรองรายการปิดสิ้นวัน/เติมเงินทอน/นำเงินออก ที่ไม่ใช่บิลขายและไม่มีหมายเหตุบิล
+        type_str = str(type_val or "").strip()
+        note_str = str(note_val or "").strip()
+        code_str = str(code_val or "").strip()
+
+        if type_str in ("ปิดสิ้นวัน", "เติมเงินทอน", "ถอนเงิน", "นำเงินออกระหว่างวัน") and not note_str:
+            continue
+
+        doc_from_note = normalize_doc_no(note_val)
+        doc_from_code = normalize_doc_no(code_val)
+
+        # เลือกรหัสเอกสาร: ถ้า note มี PJ/ตัวเลข ให้ใช้ note ก่อน ถ้าไม่มีให้ดูที่ Col B
+        pj_doc = doc_from_note if doc_from_note.startswith("PJ") else (doc_from_code if doc_from_code.startswith("PJ") else doc_from_note)
+
+        rows_data.append({
+            "report_row": r,
+            "datetime": str(time_val or "").strip(),
+            "tx_code": str(code_val or "").strip(),
+            "tx_type": str(type_val or "").strip(),
+            "amount": parse_amount(amount_val),
+            "status": str(status_val or "").strip(),
+            "note_raw": str(note_val or "").strip(),
+            "pj_doc": pj_doc
+        })
+
+    logger.info(f"อ่านไฟล์ Report สำเร็จ: {len(rows_data)} แถว")
+    return rows_data
+
+
+def read_master_file(filepath):
+    """
+    อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
+    รองรับการถอดรหัสภาษาไทย CP874 จาก Excel 97-2003
+    สกัด: เลขที่เอกสาร (Col B - PJ...), ชื่อลูกหนี้ (Col D), มูลค่าสุทธิ (Col M)
+    """
+    if filepath.lower().endswith(".xls"):
+        try:
+            wb = xlrd.open_workbook(filepath, encoding_override="cp874")
+        except Exception:
+            wb = xlrd.open_workbook(filepath)
+        sh = wb.sheet_by_index(0)
+
+        master_data = {}
+        for r in range(sh.nrows):
+            if sh.ncols < 2:
+                continue
+
+            doc_cell = sh.cell_value(r, 1)  # Col B (index 1)
+            doc_str = str(doc_cell).strip()
+            norm_doc = normalize_doc_no(doc_str)
+
+            if norm_doc.startswith("PJ"):
+                cust_name = str(sh.cell_value(r, 3)).strip() if sh.ncols > 3 else ""
+                val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
+                val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
+
+                master_data[norm_doc] = {
+                    "master_row": r + 1,
+                    "doc_no_raw": doc_str,
+                    "customer_name": cust_name,
+                    "val_before": val_before,
+                    "val_net": val_net
+                }
+    else:
+        # กรณีเป็น .xlsx
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        ws = wb.active
+        master_data = {}
+        for r in range(1, ws.max_row + 1):
+            doc_cell = ws.cell(r, 2).value  # Col B
+            doc_str = str(doc_cell or "").strip()
+            norm_doc = normalize_doc_no(doc_str)
+
+            if norm_doc.startswith("PJ"):
+                cust_name = str(ws.cell(r, 4).value or "").strip()
+                val_before = parse_amount(ws.cell(r, 9).value)
+                val_net = parse_amount(ws.cell(r, 13).value)
+
+                master_data[norm_doc] = {
+                    "master_row": r,
+                    "doc_no_raw": doc_str,
+                    "customer_name": cust_name,
+                    "val_before": val_before,
+                    "val_net": val_net
+                }
+
+    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ทั้งหมด {len(master_data)} รายการ")
+    return master_data
+
+
+def process_matching(report_rows, master_dict):
+    """
+    ทำการ Match ข้อมูลระหว่าง Report และ Master:
+    - Match เลขที่เอกสาร PJ
+    - ตรวจสอบยอดเงิน (Report ยอดเงิน Col D == Master มูลค่าสุทธิ Col M)
+    """
+    matched_list = []
+    mismatch_list = []
+    not_found_report = []
+
+    matched_master_keys = set()
+
+    for item in report_rows:
+        pj_key = item["pj_doc"]
+
+        # ถ้าใน Report ไม่มีเลขที่เอกสารหรือระบุเป็นปิดสิ้นวัน/เติมเงินทอน
+        if not pj_key:
+            continue
+
+        if pj_key in master_dict:
+            m_info = master_dict[pj_key]
+            matched_master_keys.add(pj_key)
+
+            rep_amt = item["amount"]
+            mast_amt = m_info["val_net"]
+            diff = round(rep_amt - mast_amt, 2)
+
+            detail = {
+                "Report แถว": item["report_row"],
+                "วันเวลาใน Report": item["datetime"],
+                "เลขที่บิล (PJ)": pj_key,
+                "หมายเหตุ Report": item["note_raw"],
+                "ยอดเงิน Report (Col D)": rep_amt,
+                "Master แถว": m_info["master_row"],
+                "เลขที่เอกสาร Master (Col B)": m_info["doc_no_raw"],
+                "ชื่อลูกค้า Master (Col D)": m_info["customer_name"],
+                "มูลค่าสุทธิ Master (Col M)": mast_amt,
+                "ผลต่าง (Report - Master)": diff,
+            }
+
+            if abs(diff) < 0.01:
+                detail["สถานะ"] = "ตรงกัน"
+                matched_list.append(detail)
+            else:
+                detail["สถานะ"] = "ยอดเงินไม่ตรงกัน"
+                detail["หมายเหตุปัญหา"] = f"ยอดเงินใน Report ({rep_amt:,.2f}) ไม่ตรงกับ Master ({mast_amt:,.2f})"
+                mismatch_list.append(detail)
+        else:
+            detail = {
+                "Report แถว": item["report_row"],
+                "วันเวลาใน Report": item["datetime"],
+                "เลขที่บิลที่สกัดได้": pj_key,
+                "หมายเหตุ Report (ดิบ)": item["note_raw"],
+                "ยอดเงิน Report (Col D)": item["amount"],
+                "สถานะ": "ไม่พบใน Master",
+                "หมายเหตุปัญหา": f"ไม่พบรหัส {pj_key} ในไฟล์ Master"
+            }
+            not_found_report.append(detail)
+
+    # ค้นหาเอกสารใน Master ที่ไม่มีใน Report
+    not_in_report = []
+    for doc_no, m_info in master_dict.items():
+        if doc_no not in matched_master_keys:
+            not_in_report.append({
+                "Master แถว": m_info["master_row"],
+                "เลขที่เอกสาร Master (Col B)": m_info["doc_no_raw"],
+                "ชื่อลูกค้า Master (Col D)": m_info["customer_name"],
+                "มูลค่าสุทธิ Master (Col M)": m_info["val_net"],
+                "สถานะ": "ไม่มีใน Report"
+            })
+
+    return {
+        "matched": matched_list,
+        "mismatched": mismatch_list,
+        "not_found_report": not_found_report,
+        "not_in_report": not_in_report,
+        "total_report_pj": len(matched_list) + len(mismatch_list) + len(not_found_report),
+        "total_master_pj": len(master_dict)
+    }
+
+
+def style_excel_sheet(ws, title_color="1F4E79"):
+    """จัดแต่งหน้าตาตาราง Excel ให้สวยงาม อ่านง่ายระดับมืออาชีพ"""
+    ws.views.sheetView[0].showGridLines = True
+
+    header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color=title_color, end_color=title_color, fill_type="solid")
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    thin_border = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9")
+    )
+
+    # Style Header Row
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(1, col)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = align_center
+        cell.border = thin_border
+    ws.row_dimensions[1].height = 28
+
+    # Style Data Rows
+    for r in range(2, ws.max_row + 1):
+        ws.row_dimensions[r].height = 20
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.font = Font(name="Segoe UI", size=10)
+            cell.border = thin_border
+
+            # รูปแบบตัวเลขและจัดกึ่งกลาง/ชิดขวา
+            if isinstance(cell.value, (int, float)):
+                header_name = str(ws.cell(1, c).value or "")
+                if "แถว" in header_name or "ลำดับ" in header_name:
+                    cell.alignment = align_center
+                    cell.number_format = "#,##0"
+                else:
+                    cell.alignment = align_right
+                    cell.number_format = "#,##0.00"
+            else:
+                cell.alignment = align_left
+
+    # Auto-adjust column widths
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = 0
+        for cell in col:
+            val = str(cell.value or "")
+            length = sum(1.5 if ord(char) > 128 else 1 for char in val)
+            if length > max_len:
+                max_len = length
+        ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 45)
+
+
+def create_result_excel(result, report_name, master_name, output_path="match_result.xlsx"):
+    """สร้างไฟล์ match_result.xlsx ที่มีหลายชีต ครอบคลุมทั้งสรุปผลและรายละเอียด"""
+    wb = openpyxl.Workbook()
+
+    # --- Sheet 1: สรุปภาพรวม (Summary) ---
+    ws_summary = wb.active
+    ws_summary.title = "สรุปภาพรวม"
+    ws_summary.views.sheetView[0].showGridLines = True
+
+    # Title Banner
+    ws_summary.merge_cells("A1:D1")
+    title_cell = ws_summary["A1"]
+    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงินประจำวัน"
+    title_cell.font = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF")
+    title_cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws_summary.row_dimensions[1].height = 35
+
+    summary_rows = [
+        ("วันที่ประมวลผล", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
+        ("ไฟล์ Report (รายการรับชำระเงิน)", os.path.basename(report_name)),
+        ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้)", os.path.basename(master_name)),
+        ("──────────────────────────────", "──────────────────"),
+        ("1. ข้อมูลที่ตรงกันสมบูรณ์ (Matched)", len(result["matched"])),
+        ("2. ข้อมูลที่ยอดเงินไม่ตรงกัน (Mismatch)", len(result["mismatched"])),
+        ("3. ข้อมูลใน Report ที่ไม่พบใน Master", len(result["not_found_report"])),
+        ("รวมรายการ Report ที่ตรวจเช็คทั้งหมด", result["total_report_pj"]),
+        ("──────────────────────────────", "──────────────────"),
+        ("4. บิลใน Master ที่ยังไม่มีใน Report", len(result["not_in_report"])),
+        ("รวมบิล PJ ใน Master ทั้งหมด", result["total_master_pj"]),
+    ]
+
+    for idx, (label, val) in enumerate(summary_rows, start=3):
+        ws_summary.cell(idx, 1, label)
+        c2 = ws_summary.cell(idx, 2, val)
+        ws_summary.cell(idx, 1).font = Font(name="Segoe UI", size=11, bold=True)
+        c2.font = Font(name="Segoe UI", size=11, bold=isinstance(val, int))
+        if isinstance(val, int):
+            c2.alignment = Alignment(horizontal="right")
+            c2.number_format = "#,##0"
+
+    # Color highlights on Summary
+    ws_summary.cell(7, 2).fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid") # เขียว
+    ws_summary.cell(8, 2).fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # ส้ม/แดง
+    ws_summary.cell(9, 2).fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid") # เหลือง
+
+    ws_summary.column_dimensions["A"].width = 42
+    ws_summary.column_dimensions["B"].width = 35
+
+    # Helper function to append dataframe to new sheet
+    def add_data_sheet(sheet_name, data_list, title_color):
+        ws = wb.create_sheet(sheet_name)
+        if not data_list:
+            ws.cell(1, 1, "ไม่มีรายการ")
+            return
+        df = pd.DataFrame(data_list)
+        df.insert(0, "ลำดับ", range(1, len(df) + 1))
+
+        # Write Header
+        headers = list(df.columns)
+        for col_idx, h in enumerate(headers, start=1):
+            ws.cell(1, col_idx, h)
+
+        # Write Rows
+        for r_idx, row in enumerate(df.itertuples(index=False), start=2):
+            for c_idx, val in enumerate(row, start=1):
+                ws.cell(r_idx, c_idx, val)
+
+        style_excel_sheet(ws, title_color=title_color)
+
+    # --- Sheet 2: ตรงกัน ---
+    add_data_sheet("ข้อมูลตรงกัน", result["matched"], "2E75B6")
+
+    # --- Sheet 3: ยอดไม่ตรงกัน ---
+    add_data_sheet("ยอดเงินไม่ตรงกัน", result["mismatched"], "C65911")
+
+    # --- Sheet 4: ไม่พบใน Master ---
+    add_data_sheet("ไม่พบใน Master", result["not_found_report"], "BF8F00")
+
+    # --- Sheet 5: Master ที่ไม่มีใน Report ---
+    add_data_sheet("Master ไม่มีใน Report", result["not_in_report"], "595959")
+
+    wb.save(output_path)
+    logger.info(f"บันทึกผลลัพธ์ลงไฟล์ Excel เรียบร้อยแล้ว: {output_path}")
+    return output_path
+
+
+def send_telegram(summary_text, file_path):
+    """ส่งข้อความสรุปผลและส่งไฟล์รายงานเข้า Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("⚠️ ไม่พบ TELEGRAM_TOKEN หรือ TELEGRAM_CHAT_ID ในระบบ (ข้ามการส่ง Telegram)")
+        return
+
+    logger.info("กำลังส่งข้อความและไฟล์เข้า Telegram...")
+
+    # 1. ส่งข้อความสรุป
+    msg_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": summary_text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        res = requests.post(msg_url, data=payload, timeout=20)
+        if res.status_code != 200:
+            payload.pop("parse_mode", None)
+            res = requests.post(msg_url, data=payload, timeout=20)
+        logger.info(f"ผลการส่งข้อความ Telegram: {res.status_code}")
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการส่งข้อความ Telegram: {e}")
+
+    # 2. ส่งไฟล์ match_result.xlsx
+    doc_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        with open(file_path, "rb") as f:
+            res_doc = requests.post(
+                doc_url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": f"📄 รายงานฉบับเต็มประจำวัน: {os.path.basename(file_path)}"
+                },
+                files={"document": f},
+                timeout=60
+            )
+        logger.info(f"ผลการส่งไฟล์ Telegram: {res_doc.status_code}")
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาดในการส่งไฟล์ Telegram: {e}")
+
+
+def main():
+    logger.info("=== เริ่มต้นระบบตรวจสอบข้อมูลประจำวัน (Daily Match Bot) ===")
+
+    # 1. ดาวน์โหลดไฟล์จาก Google Drive
+    download_dir = download_drive_folder()
+
+    # 2. ค้นหาไฟล์ Report และไฟล์ Master ล่าสุด
+    report_file, master_file = find_target_files([download_dir, "."])
+
+    # 3. อ่านและเตรียมข้อมูล
+    report_rows = read_report_file(report_file)
+    master_dict = read_master_file(master_file)
+
+    # 4. ทำการ Match ข้อมูล
+    result = process_matching(report_rows, master_dict)
+
+    # 5. สร้างไฟล์ Excel สรุปผล
+    output_excel = "match_result.xlsx"
+    create_result_excel(result, report_file, master_file, output_excel)
+
+    # 6. เตรียมข้อความสรุปเข้า Telegram
+    n_match = len(result["matched"])
+    n_mismatch = len(result["mismatched"])
+    n_not_found = len(result["not_found_report"])
+    n_total_report = result["total_report_pj"]
+    n_not_in_rep = len(result["not_in_report"])
+
+    summary_msg = (
+        f"📊 *รายงานสรุปการ Match ข้อมูลประจำวัน*\n"
+        f"📅 ประมวลผลเมื่อ: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+        f"────────────────────────\n"
+        f"📁 *Report:* `{os.path.basename(report_file)}`\n"
+        f"📁 *Master:* `{os.path.basename(master_file)}`\n\n"
+        f"📈 *สรุปผลการตรวจสอบ:*\n"
+        f"✅ *ข้อมูลตรงกัน:* {n_match} แถว\n"
+        f"⚠️ *ยอดเงินไม่ตรงกัน:* {n_mismatch} แถว\n"
+        f"🔍 *ไม่พบใน Master:* {n_not_found} แถว\n"
+        f"📋 *รวมรายการที่ตรวจเช็ค:* {n_total_report} แถว\n\n"
+        f"📌 *บิล Master ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
+        f"────────────────────────\n"
+        f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `match_result.xlsx` มาด้วยแล้วครับ*"
+    )
+
+    print("\n" + summary_msg + "\n")
+
+    # 7. ส่งเข้า Telegram
+    send_telegram(summary_msg, output_excel)
+    logger.info("=== เสร็จสิ้นกระบวนการทำงานเรียบร้อย ===")
+
+
+if __name__ == "__main__":
+    main()
