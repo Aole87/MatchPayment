@@ -71,9 +71,19 @@ def find_target_files(search_dirs=None):
     if not master_candidates:
         raise FileNotFoundError("ไม่พบไฟล์ประเภท Master (เช่น 5-11.xls)")
 
-    # เลือกไฟล์ล่าสุดตามเวลาแก้ไข (หรือชื่อไฟล์)
-    latest_report = max(report_candidates, key=os.path.getmtime)
-    latest_master = max(master_candidates, key=os.path.getmtime)
+    def sort_key(filepath):
+        """จัดเรียงตามเวลาแก้ไขไฟล์ และชื่อไฟล์ที่มีตัวเลขวันที่กำกับ"""
+        fname = os.path.basename(filepath)
+        mtime = os.path.getmtime(filepath)
+        # ดึงตัวเลขวันที่จากชื่อไฟล์เพื่อความแม่นยำสูง แม้เวลาดาวน์โหลดจะตรงกัน
+        # ตัวอย่าง Report_20261106_131614 -> 20261106131614
+        nums = re.findall(r"\d+", fname)
+        num_score = int("".join(nums)) if nums else 0
+        return (mtime, num_score, fname)
+
+    # เลือกไฟล์ล่าสุด
+    latest_report = max(report_candidates, key=sort_key)
+    latest_master = max(master_candidates, key=sort_key)
 
     logger.info(f"ไฟล์ Report ที่เลือก: {latest_report}")
     logger.info(f"ไฟล์ Master ที่เลือก: {latest_master}")
