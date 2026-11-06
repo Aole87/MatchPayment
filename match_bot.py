@@ -100,29 +100,27 @@ def find_target_files(search_dirs=None):
 
 
 def normalize_doc_no(val):
-    """แปลงค่ารหัสเอกสารให้เป็นมาตรฐาน PJXXXXXXX"""
+    """
+    แปลงค่ารหัสเอกสารให้เป็นมาตรฐาน PJXXXXXXX
+    ถ้าในคอลัมน์ไม่มีเลข หรือเป็นค่าว่าง จะไม่พยายามสร้างค่าขึ้นมาเองเด็ดขาด
+    """
     if val is None:
         return ""
     val_str = str(val).strip()
-    if not val_str or val_str.lower() in ("nan", "none", "-"):
+    if not val_str or val_str.lower() in ("nan", "none", "-", ""):
         return ""
 
-    # ค้นหา PJ ตามด้วยตัวเลข เช่น PJ1547564
+    # ค้นหาคำว่า PJ ตามด้วยตัวเลข เช่น PJ1547564
     match_pj = re.search(r"PJ\s*(\d+)", val_str, re.IGNORECASE)
     if match_pj:
         return f"PJ{match_pj.group(1)}"
 
-    # ถ้าเป็นตัวเลขล้วน ดึงเลข 6-8 หลักแรก
-    match_num = re.search(r"\b(\d{6,8})\b", val_str)
+    # ถ้ามีตัวเลขชัดเจนในหมายเหตุ เช่น 1547564
+    match_num = re.search(r"(\d{4,})", val_str)
     if match_num:
         return f"PJ{match_num.group(1)}"
 
-    # กรณีเลขทั่วไป
-    match_any_num = re.search(r"(\d+)", val_str)
-    if match_any_num and len(match_any_num.group(1)) >= 4:
-        return f"PJ{match_any_num.group(1)}"
-
-    return val_str
+    return ""
 
 
 def parse_amount(val):
@@ -165,10 +163,14 @@ def read_report_file(filepath):
             continue
 
         doc_from_note = normalize_doc_no(note_val)
-        doc_from_code = normalize_doc_no(code_val)
+        # ตรวจสอบ Col B เฉพาะกรณีที่มีคำว่า PJ ชัดเจนเท่านั้น (ห้ามแปลงวันที่ในรหัส SAL_ เด็ดขาด)
+        doc_from_code = normalize_doc_no(code_val) if (code_val and "PJ" in str(code_val).upper()) else ""
 
-        # เลือกรหัสเอกสาร: ถ้า note มี PJ/ตัวเลข ให้ใช้ note ก่อน ถ้าไม่มีให้ดูที่ Col B
-        pj_doc = doc_from_note if doc_from_note.startswith("PJ") else (doc_from_code if doc_from_code.startswith("PJ") else doc_from_note)
+        pj_doc = doc_from_note or doc_from_code
+
+        # ถ้าในคอลัมน์ไม่มีเลข ไม่ต้องพยายามจับคู่ ข้ามรายการนี้ไป
+        if not pj_doc:
+            continue
 
         rows_data.append({
             "report_row": r,
