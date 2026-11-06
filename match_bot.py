@@ -1,5 +1,7 @@
 import os
+import sys
 import re
+import time
 import glob
 import logging
 from datetime import datetime
@@ -11,7 +13,7 @@ import xlrd
 import requests
 import gdown
 
-# --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables / GitHub Secrets) ---
+# --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables หรือใช้ค่า Default) ---
 DEFAULT_DRIVE_FOLDER = "https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing"
 GDRIVE_FOLDER_URL = os.environ.get("GDRIVE_FOLDER_URL", DEFAULT_DRIVE_FOLDER)
 
@@ -75,8 +77,6 @@ def find_target_files(search_dirs=None):
         """จัดเรียงตามเวลาแก้ไขไฟล์ และชื่อไฟล์ที่มีตัวเลขวันที่กำกับ"""
         fname = os.path.basename(filepath)
         mtime = os.path.getmtime(filepath)
-        # ดึงตัวเลขวันที่จากชื่อไฟล์เพื่อความแม่นยำสูง แม้เวลาดาวน์โหลดจะตรงกัน
-        # ตัวอย่าง Report_20261106_131614 -> 20261106131614
         nums = re.findall(r"\d+", fname)
         num_score = int("".join(nums)) if nums else 0
         return (mtime, num_score, fname)
@@ -103,7 +103,7 @@ def normalize_doc_no(val):
     if match_pj:
         return f"PJ{match_pj.group(1)}"
 
-    # ถ้าเป็นตัวเลขล้วน (เช่น 1547564 หรือ 1547563 0091213) ดึงเลข 6-8 หลักแรก
+    # ถ้าเป็นตัวเลขล้วน ดึงเลข 6-8 หลักแรก
     match_num = re.search(r"\b(\d{6,8})\b", val_str)
     if match_num:
         return f"PJ{match_num.group(1)}"
@@ -151,7 +151,6 @@ def read_report_file(filepath):
         # กรองรายการปิดสิ้นวัน/เติมเงินทอน/นำเงินออก ที่ไม่ใช่บิลขายและไม่มีหมายเหตุบิล
         type_str = str(type_val or "").strip()
         note_str = str(note_val or "").strip()
-        code_str = str(code_val or "").strip()
 
         if type_str in ("ปิดสิ้นวัน", "เติมเงินทอน", "ถอนเงิน", "นำเงินออกระหว่างวัน") and not note_str:
             continue
@@ -195,7 +194,7 @@ def read_master_file(filepath):
             if sh.ncols < 2:
                 continue
 
-            doc_cell = sh.cell_value(r, 1)  # Col B (index 1)
+            doc_cell = sh.cell_value(r, 1)  # Col B
             doc_str = str(doc_cell).strip()
             norm_doc = normalize_doc_no(doc_str)
 
@@ -212,7 +211,6 @@ def read_master_file(filepath):
                     "val_net": val_net
                 }
     else:
-        # กรณีเป็น .xlsx
         wb = openpyxl.load_workbook(filepath, data_only=True)
         ws = wb.active
         master_data = {}
@@ -253,7 +251,6 @@ def process_matching(report_rows, master_dict):
     for item in report_rows:
         pj_key = item["pj_doc"]
 
-        # ถ้าใน Report ไม่มีเลขที่เอกสารหรือระบุเป็นปิดสิ้นวัน/เติมเงินทอน
         if not pj_key:
             continue
 
@@ -353,7 +350,6 @@ def style_excel_sheet(ws, title_color="1F4E79"):
             cell.font = Font(name="Segoe UI", size=10)
             cell.border = thin_border
 
-            # รูปแบบตัวเลขและจัดกึ่งกลาง/ชิดขวา
             if isinstance(cell.value, (int, float)):
                 header_name = str(ws.cell(1, c).value or "")
                 if "แถว" in header_name or "ลำดับ" in header_name:
@@ -418,15 +414,13 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
             c2.alignment = Alignment(horizontal="right")
             c2.number_format = "#,##0"
 
-    # Color highlights on Summary
-    ws_summary.cell(7, 2).fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid") # เขียว
-    ws_summary.cell(8, 2).fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid") # ส้ม/แดง
-    ws_summary.cell(9, 2).fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid") # เหลือง
+    ws_summary.cell(7, 2).fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    ws_summary.cell(8, 2).fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    ws_summary.cell(9, 2).fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
     ws_summary.column_dimensions["A"].width = 42
     ws_summary.column_dimensions["B"].width = 35
 
-    # Helper function to append dataframe to new sheet
     def add_data_sheet(sheet_name, data_list, title_color):
         ws = wb.create_sheet(sheet_name)
         if not data_list:
@@ -435,28 +429,19 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
         df = pd.DataFrame(data_list)
         df.insert(0, "ลำดับ", range(1, len(df) + 1))
 
-        # Write Header
         headers = list(df.columns)
         for col_idx, h in enumerate(headers, start=1):
             ws.cell(1, col_idx, h)
 
-        # Write Rows
         for r_idx, row in enumerate(df.itertuples(index=False), start=2):
             for c_idx, val in enumerate(row, start=1):
                 ws.cell(r_idx, c_idx, val)
 
         style_excel_sheet(ws, title_color=title_color)
 
-    # --- Sheet 2: ตรงกัน ---
     add_data_sheet("ข้อมูลตรงกัน", result["matched"], "2E75B6")
-
-    # --- Sheet 3: ยอดไม่ตรงกัน ---
     add_data_sheet("ยอดเงินไม่ตรงกัน", result["mismatched"], "C65911")
-
-    # --- Sheet 4: ไม่พบใน Master ---
     add_data_sheet("ไม่พบใน Master", result["not_found_report"], "BF8F00")
-
-    # --- Sheet 5: Master ที่ไม่มีใน Report ---
     add_data_sheet("Master ไม่มีใน Report", result["not_in_report"], "595959")
 
     wb.save(output_path)
@@ -464,18 +449,17 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
     return output_path
 
 
-def send_telegram(summary_text, file_path):
+def send_telegram(summary_text, file_path=None, chat_id=None):
     """ส่งข้อความสรุปผลและส่งไฟล์รายงานเข้า Telegram"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("⚠️ ไม่พบ TELEGRAM_TOKEN หรือ TELEGRAM_CHAT_ID ในระบบ (ข้ามการส่ง Telegram)")
-        return
-
-    logger.info("กำลังส่งข้อความและไฟล์เข้า Telegram...")
+    target_chat = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_TOKEN or not target_chat:
+        logger.warning("⚠️ ไม่พบ TELEGRAM_TOKEN หรือ TELEGRAM_CHAT_ID ในระบบ")
+        return False
 
     # 1. ส่งข้อความสรุป
     msg_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": summary_text,
         "parse_mode": "Markdown"
     }
@@ -487,27 +471,33 @@ def send_telegram(summary_text, file_path):
         logger.info(f"ผลการส่งข้อความ Telegram: {res.status_code}")
     except Exception as e:
         logger.error(f"เกิดข้อผิดพลาดในการส่งข้อความ Telegram: {e}")
+        return False
 
-    # 2. ส่งไฟล์ match_result.xlsx
-    doc_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    try:
-        with open(file_path, "rb") as f:
-            res_doc = requests.post(
-                doc_url,
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": f"📄 รายงานฉบับเต็มประจำวัน: {os.path.basename(file_path)}"
-                },
-                files={"document": f},
-                timeout=60
-            )
-        logger.info(f"ผลการส่งไฟล์ Telegram: {res_doc.status_code}")
-    except Exception as e:
-        logger.error(f"เกิดข้อผิดพลาดในการส่งไฟล์ Telegram: {e}")
+    # 2. ส่งไฟล์ Excel (ถ้ามี)
+    if file_path and os.path.exists(file_path):
+        doc_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        try:
+            with open(file_path, "rb") as f:
+                res_doc = requests.post(
+                    doc_url,
+                    data={
+                        "chat_id": target_chat,
+                        "caption": f"📄 รายงานฉบับเต็มประจำวัน: {os.path.basename(file_path)}"
+                    },
+                    files={"document": f},
+                    timeout=60
+                )
+            logger.info(f"ผลการส่งไฟล์ Telegram: {res_doc.status_code}")
+        except Exception as e:
+            logger.error(f"เกิดข้อผิดพลาดในการส่งไฟล์ Telegram: {e}")
+
+    return True
 
 
-def main():
-    logger.info("=== เริ่มต้นระบบตรวจสอบข้อมูลประจำวัน (Daily Match Bot) ===")
+def run_matching_job(chat_id=None):
+    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลักแบบรอบเดียว (One-off Job)"""
+    logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล ===")
+    target_chat = chat_id or TELEGRAM_CHAT_ID
 
     # 1. ดาวน์โหลดไฟล์จาก Google Drive
     download_dir = download_drive_folder()
@@ -526,7 +516,7 @@ def main():
     output_excel = "match_result.xlsx"
     create_result_excel(result, report_file, master_file, output_excel)
 
-    # 6. เตรียมข้อความสรุปเข้า Telegram
+    # 6. เตรียมข้อความสรุป
     n_match = len(result["matched"])
     n_mismatch = len(result["mismatched"])
     n_not_found = len(result["not_found_report"])
@@ -551,9 +541,96 @@ def main():
 
     print("\n" + summary_msg + "\n")
 
-    # 7. ส่งเข้า Telegram
-    send_telegram(summary_msg, output_excel)
+    # 7. ส่งผลลัพธ์เข้า Telegram
+    send_telegram(summary_msg, output_excel, chat_id=target_chat)
     logger.info("=== เสร็จสิ้นกระบวนการทำงานเรียบร้อย ===")
+    return result
+
+
+def start_telegram_listener():
+    """
+    โหมดรันเป็น Bot Listener ตลอดเวลา:
+    คอยรับข้อความใน Telegram เมื่อผู้ใช้พิมพ์คำว่า "Match Data" (หรือ /match)
+    จะสั่งรันประมวลผลและตอบกลับรายงานพร้อมไฟล์ Excel ทันที
+    """
+    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง 'Match Data'...")
+    offset = None
+
+    # ส่งข้อความแจ้งผู้ใช้ว่าบอทออนไลน์แล้ว
+    send_telegram(
+        "🤖 *บอท Ploy(Accounting) ออนไลน์แล้วครับ!*\n\n"
+        "พิมพ์คำว่า *Match Data* เพื่อสั่งให้ตรวจสอบและจับคู่ข้อมูลยอดเงินทันที",
+        chat_id=TELEGRAM_CHAT_ID
+    )
+
+    while True:
+        try:
+            params = {"timeout": 25}
+            if offset is not None:
+                params["offset"] = offset
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            res = requests.get(url, params=params, timeout=30)
+            if res.status_code != 200:
+                time.sleep(3)
+                continue
+
+            data = res.json()
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+
+            for update in data.get("result", []):
+                update_id = update["update_id"]
+                offset = update_id + 1
+
+                msg = update.get("message")
+                if not msg:
+                    continue
+
+                chat = msg.get("chat", {})
+                chat_id = chat.get("id")
+                text = str(msg.get("text", "")).strip()
+
+                logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
+
+                text_lower = text.lower()
+                # ตรวจจับคำสั่ง Match Data
+                if text_lower in ("match data", "matchdata", "match", "/match"):
+                    send_telegram(
+                        "⏳ *ได้รับคำสั่ง Match Data เรียบร้อยแล้ว!*\n"
+                        "กำลังดาวน์โหลดไฟล์จาก Google Drive และประมวลผลข้อมูล กรุณารอสักครู่...",
+                        chat_id=chat_id
+                    )
+                    try:
+                        run_matching_job(chat_id=chat_id)
+                    except Exception as err:
+                        logger.error(f"เกิดข้อผิดพลาดในการประมวลผล: {err}", exc_info=True)
+                        send_telegram(f"❌ *เกิดข้อผิดพลาดในการประมวลผล:*\n`{str(err)}`", chat_id=chat_id)
+
+                elif text_lower in ("/start", "/help"):
+                    send_telegram(
+                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล*\n\n"
+                        "💡 *คำสั่งที่รองรับ:*\n"
+                        "• พิมพ์คำว่า *Match Data* เพื่อเริ่มการตรวจสอบข้อมูลทันที\n"
+                        "• หรือกดปุ่มรันผ่าน GitHub Actions ได้ตลอดเวลาครับ",
+                        chat_id=chat_id
+                    )
+
+        except requests.exceptions.RequestException as re_err:
+            logger.warning(f"Connection error: {re_err}, retrying in 5s...")
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Listener error: {e}", exc_info=True)
+            time.sleep(3)
+
+
+def main():
+    # ตรวจสอบว่าผู้ใช้สั่งให้รันโหมด Listener หรือรันแบบรอบเดียว
+    if "--listen" in sys.argv or "-l" in sys.argv:
+        start_telegram_listener()
+    else:
+        run_matching_job()
 
 
 if __name__ == "__main__":
