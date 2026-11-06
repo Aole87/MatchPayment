@@ -30,17 +30,24 @@ def download_drive_folder(folder_url=GDRIVE_FOLDER_URL, output_dir="downloads"):
     logger.info(f"กำลังดาวน์โหลดไฟล์จาก Google Drive: {folder_url}")
     try:
         downloaded = gdown.download_folder(
-            folder_url,
+            url=folder_url,
             output=output_dir,
             quiet=False,
-            use_cookies=False,
-            remaining_ok=True
+            use_cookies=False
         )
         logger.info(f"ดาวน์โหลดสำเร็จ ได้รับไฟล์: {downloaded}")
         return output_dir
     except Exception as e:
-        logger.error(f"เกิดข้อผิดพลาดในการดาวน์โหลดด้วย gdown: {e}")
-        return output_dir
+        logger.warning(f"gdown.download_folder API error: {e}, กำลังลองด้วย gdown CLI...")
+        try:
+            import subprocess
+            cmd = [sys.executable, "-m", "gdown", "--folder", folder_url, "-O", output_dir]
+            logger.info(f"รันคำสั่ง CLI: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+            return output_dir
+        except Exception as e2:
+            logger.error(f"เกิดข้อผิดพลาดในการดาวน์โหลดด้วย gdown CLI: {e2}")
+            return output_dir
 
 
 def find_target_files(search_dirs=None):
