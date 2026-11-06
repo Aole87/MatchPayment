@@ -6,3 +6,4 @@ cd "$DIR"
 echo "🤖 กำลังเปิดระบบบอทรับคำสั่ง Telegram (Match Data)..."
 source .venv/bin/activate
 python match_bot.py --listen
+
