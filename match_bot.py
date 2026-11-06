@@ -15,8 +15,8 @@ import gdown
 DEFAULT_DRIVE_FOLDER = "https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing"
 GDRIVE_FOLDER_URL = os.environ.get("GDRIVE_FOLDER_URL", DEFAULT_DRIVE_FOLDER)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8999661395:AAGMuIUlp0WU4rq5nk_WQs6cOblkB38D270").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7603648423").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
