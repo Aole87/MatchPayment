@@ -15,7 +15,7 @@ import gdown
 
 # --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables หรือใช้ค่า Default) ---
 DEFAULT_DRIVE_FOLDER = "https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing"
-GDRIVE_FOLDER_URL = os.environ.get("GDRIVE_FOLDER_URL", DEFAULT_DRIVE_FOLDER)
+GDRIVE_FOLDER_URL = (os.environ.get("GDRIVE_FOLDER_URL", "").strip()) or DEFAULT_DRIVE_FOLDER
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8999661395:AAGMuIUlp0WU4rq5nk_WQs6cOblkB38D270").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7603648423").strip()
@@ -24,8 +24,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def download_drive_folder(folder_url=GDRIVE_FOLDER_URL, output_dir="downloads"):
+def download_drive_folder(folder_url=None, output_dir="downloads"):
     """ดาวน์โหลดไฟล์ทั้งหมดจาก Google Drive Folder สาธารณะ"""
+    if not folder_url:
+        folder_url = GDRIVE_FOLDER_URL or DEFAULT_DRIVE_FOLDER
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"กำลังดาวน์โหลดไฟล์จาก Google Drive: {folder_url}")
     try:
