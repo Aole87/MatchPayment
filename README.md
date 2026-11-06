@@ -42,7 +42,7 @@
    - *(ทางเลือก)* `GDRIVE_FOLDER_URL`: ลิงก์ Google Drive Folder (หากไม่ใส่จะใช้โฟลเดอร์เริ่มต้นที่ตั้งไว้ในระบบ)
 
 ### การทำงานอัตโนมัติ:
-- ระบบถูกตั้งเวลาให้ทำงานอัตโนมัติทุกวันเวลา **08:00 น.** ตามเวลาประเทศไทย ผ่าน [`.github/workflows/daily_match.yml`](.github/workflows/daily_match.yml)
+- ระบบถูกตั้งเวลาให้ทำงานอัตโนมัติทุกวันเวลา **06:00 น.** ตามเวลาประเทศไทย ผ่าน [`.github/workflows/daily_match.yml`](.github/workflows/daily_match.yml)
 - สามารถกดปุ่ม **Run workflow** ในแท็บ **Actions** บน GitHub เพื่อสั่งรันประมวลผลแบบทันที (Manual) ได้ตลอดเวลา
 - ไฟล์ `match_result.xlsx` จะถูกส่งเข้า Telegram ทันที และถูกเก็บไว้เป็น Artifact บน GitHub Actions นาน 30 วัน
 
