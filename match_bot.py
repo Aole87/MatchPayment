@@ -505,6 +505,75 @@ def send_telegram(summary_text, file_path=None, chat_id=None):
     return True
 
 
+def upload_to_google_drive(file_path):
+    """
+    อัปโหลดไฟล์ผลลัพธ์ไปยัง Google Drive Folder
+    รองรับทั้ง Google Apps Script Web App (GDRIVE_UPLOAD_URL)
+    และ Google Service Account (GDRIVE_SERVICE_ACCOUNT_JSON)
+    """
+    upload_url = os.environ.get("GDRIVE_UPLOAD_URL", "").strip()
+    service_account_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+    filename = os.path.basename(file_path)
+
+    # 1. วิธีที่ 1: ผ่าน Google Apps Script Web App (วิธีที่สะดวกและง่ายที่สุด)
+    if upload_url:
+        logger.info(f"กำลังอัปโหลด {filename} ไปยัง Google Drive ผ่าน Web App...")
+        try:
+            import base64
+            with open(file_path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("utf-8")
+            resp = requests.post(upload_url, data={"filename": filename, "file": encoded}, timeout=60)
+            if resp.status_code == 200:
+                logger.info(f"✅ อัปโหลดไฟล์ {filename} ไปยัง Google Drive สำเร็จ!")
+                return True
+            else:
+                logger.error(f"อัปโหลดล้มเหลว (Status {resp.status_code}): {resp.text}")
+        except Exception as e:
+            logger.error(f"เกิดข้อผิดพลาดในการอัปโหลดผ่าน Web App: {e}")
+
+    # 2. วิธีที่ 2: ผ่าน Google Service Account JSON
+    elif service_account_json:
+        logger.info(f"กำลังอัปโหลด {filename} ไปยัง Google Drive ผ่าน Service Account...")
+        try:
+            import json
+            from google.oauth2 import service_account
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+
+            creds_dict = json.loads(service_account_json)
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/drive.file"]
+            )
+            service = build("drive", "v3", credentials=creds)
+
+            folder_id = "17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g"
+            file_metadata = {
+                "name": filename,
+                "parents": [folder_id]
+            }
+            media = MediaFileUpload(
+                file_path,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink"
+            ).execute()
+            logger.info(f"✅ อัปโหลดไฟล์ {filename} ไปยัง Google Drive สำเร็จ! ID: {file.get('id')}")
+            return True
+        except Exception as e:
+            logger.error(f"เกิดข้อผิดพลาดในการอัปโหลดผ่าน Service Account: {e}")
+    else:
+        logger.info(
+            f"ℹ️ ไฟล์ '{filename}' ถูกบันทึกไว้ในเครื่องเรียบร้อยแล้ว\n"
+            f"(หากต้องการให้อัปโหลดเข้า Google Drive อัตโนมัติ สามารถเพิ่ม GDRIVE_UPLOAD_URL ใน Secrets)"
+        )
+
+    return False
+
+
 def run_matching_job(chat_id=None):
     """ฟังก์ชันประมวลผลการ Match ข้อมูลหลักแบบรอบเดียว (One-off Job)"""
     logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล ===")
@@ -523,11 +592,19 @@ def run_matching_job(chat_id=None):
     # 4. ทำการ Match ข้อมูล
     result = process_matching(report_rows, master_dict)
 
-    # 5. สร้างไฟล์ Excel สรุปผล
-    output_excel = "match_result.xlsx"
+    # 5. สร้างไฟล์ Excel สรุปผล โดยตั้งชื่อเป็น match_result_ตามด้วยวันที่.xlsx
+    import shutil
+    date_str = datetime.now().strftime("%Y%m%d")
+    output_excel = f"match_result_{date_str}.xlsx"
     create_result_excel(result, report_file, master_file, output_excel)
 
-    # 6. เตรียมข้อความสรุป
+    # ทำสำเนาเป็น match_result.xlsx ไว้ด้วย
+    shutil.copyfile(output_excel, "match_result.xlsx")
+
+    # 6. อัปโหลดไฟล์ผลลัพธ์เข้า Google Drive
+    upload_to_google_drive(output_excel)
+
+    # 7. เตรียมข้อความสรุป
     n_match = len(result["matched"])
     n_mismatch = len(result["mismatched"])
     n_not_found = len(result["not_found_report"])
@@ -547,12 +624,12 @@ def run_matching_job(chat_id=None):
         f"📋 *รวมรายการที่ตรวจเช็ค:* {n_total_report} แถว\n\n"
         f"📌 *บิล Master ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
         f"────────────────────────\n"
-        f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `match_result.xlsx` มาด้วยแล้วครับ*"
+        f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วครับ*"
     )
 
     print("\n" + summary_msg + "\n")
 
-    # 7. ส่งผลลัพธ์เข้า Telegram
+    # 8. ส่งผลลัพธ์เข้า Telegram
     send_telegram(summary_msg, output_excel, chat_id=target_chat)
     logger.info("=== เสร็จสิ้นกระบวนการทำงานเรียบร้อย ===")
     return result
