@@ -57,7 +57,10 @@ def find_target_files(search_dirs=None):
     ค้นหาไฟล์ Report ล่าสุด และไฟล์ Master (เช่น 5-11.xls)
     โดยรองรับการเปลี่ยนชื่อไฟล์ทุกวันอัตโนมัติ
     """
-    if search_dirs is None:
+    # ตรวจสอบโฟลเดอร์ downloads ก่อนเป็นอันดับแรก หากมีไฟล์ที่เพิ่งดาวน์โหลดมาให้ใช้โฟลเดอร์นี้เท่านั้น
+    if os.path.exists("downloads") and any(f.lower().endswith((".xlsx", ".xls")) for f in os.listdir("downloads")):
+        search_dirs = ["downloads"]
+    elif search_dirs is None:
         search_dirs = ["downloads", "."]
 
     all_files = []

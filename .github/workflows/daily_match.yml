@@ -2,8 +2,8 @@ name: Daily Data Matching Bot
 
 on:
   schedule:
-    # รันอัตโนมัติทุกวันเวลา 06:00 น. ตามเวลาไทย (23:00 UTC)
-    - cron: '0 23 * * *'
+    # รันอัตโนมัติทุกวันเวลา 06:05 น. ตามเวลาไทย (23:05 UTC เพื่อเลี่ยงคิวหน่วงของ GitHub ตอนต้นชั่วโมง)
+    - cron: '5 23 * * *'
   workflow_dispatch: # ปุ่มกดรันระบบเองแบบ Manual ได้ตลอดเวลาใน GitHub Actions
 
 jobs:
