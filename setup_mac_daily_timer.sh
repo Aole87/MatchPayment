@@ -41,3 +41,4 @@ launchctl unload "$PLIST_PATH" 2>/dev/null
 launchctl load "$PLIST_PATH"
 
 echo "✅ ติดตั้งเรียบร้อย! ระบบจะทำงานทุกวันเวลา 06:00 น. ตรง แม้ปิดหน้าจอ เมื่อเครื่องตื่นจะทำงานต่อทันที"
+

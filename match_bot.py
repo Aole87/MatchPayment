@@ -4,6 +4,7 @@ import re
 import time
 import glob
 import logging
+import shutil
 from datetime import datetime
 import pandas as pd
 import openpyxl
@@ -54,10 +55,9 @@ def download_drive_folder(folder_url=None, output_dir="downloads"):
 
 def find_target_files(search_dirs=None):
     """
-    ค้นหาไฟล์ Report ล่าสุด และไฟล์ Master (เช่น 5-11.xls)
+    ค้นหาไฟล์ Report ล่าสุด และไฟล์ Master (เช่น 5-11.xls / 6-11.xls)
     โดยรองรับการเปลี่ยนชื่อไฟล์ทุกวันอัตโนมัติ
     """
-    # ตรวจสอบโฟลเดอร์ downloads ก่อนเป็นอันดับแรก หากมีไฟล์ที่เพิ่งดาวน์โหลดมาให้ใช้โฟลเดอร์นี้เท่านั้น
     if os.path.exists("downloads") and any(f.lower().endswith((".xlsx", ".xls")) for f in os.listdir("downloads")):
         search_dirs = ["downloads"]
     elif search_dirs is None:
@@ -76,7 +76,6 @@ def find_target_files(search_dirs=None):
     if not all_files:
         raise FileNotFoundError("ไม่พบไฟล์ Excel ในโฟลเดอร์สำหรับประมวลผล")
 
-    # แยกไฟล์ Report และไฟล์ Master
     report_candidates = [f for f in all_files if "report" in os.path.basename(f).lower()]
     master_candidates = [f for f in all_files if "report" not in os.path.basename(f).lower()]
 
@@ -86,44 +85,18 @@ def find_target_files(search_dirs=None):
         raise FileNotFoundError("ไม่พบไฟล์ประเภท Master (เช่น 5-11.xls)")
 
     def sort_key(filepath):
-        """จัดเรียงตามเวลาแก้ไขไฟล์ และชื่อไฟล์ที่มีตัวเลขวันที่กำกับ"""
         fname = os.path.basename(filepath)
         mtime = os.path.getmtime(filepath)
         nums = re.findall(r"\d+", fname)
         num_score = int("".join(nums)) if nums else 0
         return (mtime, num_score, fname)
 
-    # เลือกไฟล์ล่าสุด
     latest_report = max(report_candidates, key=sort_key)
     latest_master = max(master_candidates, key=sort_key)
 
     logger.info(f"ไฟล์ Report ที่เลือก: {latest_report}")
     logger.info(f"ไฟล์ Master ที่เลือก: {latest_master}")
     return latest_report, latest_master
-
-
-def normalize_doc_no(val):
-    """
-    แปลงค่ารหัสเอกสารให้เป็นมาตรฐาน PJXXXXXXX
-    ถ้าในคอลัมน์ไม่มีเลข หรือเป็นค่าว่าง จะไม่พยายามสร้างค่าขึ้นมาเองเด็ดขาด
-    """
-    if val is None:
-        return ""
-    val_str = str(val).strip()
-    if not val_str or val_str.lower() in ("nan", "none", "-", ""):
-        return ""
-
-    # ค้นหาคำว่า PJ ตามด้วยตัวเลข เช่น PJ1547564
-    match_pj = re.search(r"PJ\s*(\d+)", val_str, re.IGNORECASE)
-    if match_pj:
-        return f"PJ{match_pj.group(1)}"
-
-    # ถ้ามีตัวเลขชัดเจนในหมายเหตุ เช่น 1547564
-    match_num = re.search(r"(\d{4,})", val_str)
-    if match_num:
-        return f"PJ{match_num.group(1)}"
-
-    return ""
 
 
 def parse_amount(val):
@@ -137,10 +110,111 @@ def parse_amount(val):
         return 0.0
 
 
+def read_master_file(filepath):
+    """
+    อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
+    รองรับทั้งเอกสารประเภท PJ, V และ *V
+    และรองรับการถอดรหัสภาษาไทย CP874 จาก Excel 97-2003
+    """
+    master_rows = []
+    master_lookup = {}
+
+    if filepath.lower().endswith(".xls"):
+        try:
+            wb = xlrd.open_workbook(filepath, encoding_override="cp874")
+        except Exception:
+            wb = xlrd.open_workbook(filepath)
+        sh = wb.sheet_by_index(0)
+
+        for r in range(sh.nrows):
+            if sh.ncols < 2:
+                continue
+
+            doc_cell = sh.cell_value(r, 1)  # Col B
+            doc_raw = str(doc_cell).strip()
+            if not doc_raw or doc_raw == "เลขที่เอกสาร":
+                continue
+
+            u = doc_raw.upper()
+            if u.startswith("PJ") or u.startswith("V") or u.startswith("*V"):
+                cust_name = str(sh.cell_value(r, 3)).strip() if sh.ncols > 3 else ""
+                val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
+                val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
+
+                info = {
+                    "master_row": r + 1,
+                    "doc_no_raw": doc_raw,
+                    "customer_name": cust_name,
+                    "val_before": val_before,
+                    "val_net": val_net
+                }
+                master_rows.append(info)
+
+                # ดัชนีสำหรับการค้นหา
+                clean_star = u.replace("*", "")
+                base_slash = clean_star.split("/")[0]
+
+                for k in [doc_raw, u, clean_star, base_slash]:
+                    master_lookup[k] = info
+
+                m_dig = re.search(r"(\d{4,})", doc_raw)
+                if m_dig:
+                    digits = m_dig.group(1)
+                    master_lookup[digits] = info
+                    if u.startswith("PJ"):
+                        master_lookup[f"PJ{digits}"] = info
+                    else:
+                        master_lookup[f"V{digits}"] = info
+                        master_lookup[f"*V{digits}"] = info
+    else:
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        ws = wb.active
+        for r in range(1, ws.max_row + 1):
+            doc_cell = ws.cell(r, 2).value  # Col B
+            doc_raw = str(doc_cell or "").strip()
+            if not doc_raw or doc_raw == "เลขที่เอกสาร":
+                continue
+
+            u = doc_raw.upper()
+            if u.startswith("PJ") or u.startswith("V") or u.startswith("*V"):
+                cust_name = str(ws.cell(r, 4).value or "").strip()
+                val_before = parse_amount(ws.cell(r, 9).value)
+                val_net = parse_amount(ws.cell(r, 13).value)
+
+                info = {
+                    "master_row": r,
+                    "doc_no_raw": doc_raw,
+                    "customer_name": cust_name,
+                    "val_before": val_before,
+                    "val_net": val_net
+                }
+                master_rows.append(info)
+
+                clean_star = u.replace("*", "")
+                base_slash = clean_star.split("/")[0]
+
+                for k in [doc_raw, u, clean_star, base_slash]:
+                    master_lookup[k] = info
+
+                m_dig = re.search(r"(\d{4,})", doc_raw)
+                if m_dig:
+                    digits = m_dig.group(1)
+                    master_lookup[digits] = info
+                    if u.startswith("PJ"):
+                        master_lookup[f"PJ{digits}"] = info
+                    else:
+                        master_lookup[f"V{digits}"] = info
+                        master_lookup[f"*V{digits}"] = info
+
+    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ, V, *V ทั้งหมด {len(master_rows)} รายการ")
+    return master_rows, master_lookup
+
+
 def read_report_file(filepath):
     """
     อ่านไฟล์ Report_*.xlsx
     สกัด: วันเวลา, รหัสรายการ, ยอดเงิน (Col D), หมายเหตุ (Col I)
+    และกรองเฉพาะแถวที่มีการระบุเลขที่บิลขายจริง
     """
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb.active
@@ -158,134 +232,99 @@ def read_report_file(filepath):
         if time_val is None and code_val is None and amount_val is None and note_val is None:
             continue
 
-        # กรองรายการปิดสิ้นวัน/เติมเงินทอน/นำเงินออก ที่ไม่ใช่บิลขายและไม่มีหมายเหตุบิล
         type_str = str(type_val or "").strip()
         note_str = str(note_val or "").strip()
+        code_str = str(code_val or "").strip()
 
+        # กรองรายการปิดสิ้นวัน/เติมเงินทอน/นำเงินออก ที่ไม่ใช่บิลขายและไม่มีหมายเหตุบิล
         if type_str in ("ปิดสิ้นวัน", "เติมเงินทอน", "ถอนเงิน", "นำเงินออกระหว่างวัน") and not note_str:
             continue
 
-        doc_from_note = normalize_doc_no(note_val)
-        # ตรวจสอบ Col B เฉพาะกรณีที่มีคำว่า PJ ชัดเจนเท่านั้น (ห้ามแปลงวันที่ในรหัส SAL_ เด็ดขาด)
-        doc_from_code = normalize_doc_no(code_val) if (code_val and "PJ" in str(code_val).upper()) else ""
+        # ถ้าไม่มีหมายเหตุ และรหัสรายการไม่ได้ขึ้นต้นด้วย PJ, V, *V ให้ข้ามไป
+        u_code = code_str.upper()
+        if not note_str and not any(u_code.startswith(p) for p in ("PJ", "V", "*V")):
+            continue
 
-        pj_doc = doc_from_note or doc_from_code
-
-        # ถ้าในคอลัมน์ไม่มีเลข ไม่ต้องพยายามจับคู่ ข้ามรายการนี้ไป
-        if not pj_doc:
+        # ตรวจสอบว่าใน note หรือ code มีตัวเลขบิลหรือไม่
+        if not re.search(r"\d{4,}", note_str) and not any(u_code.startswith(p) for p in ("PJ", "V", "*V")):
             continue
 
         rows_data.append({
             "report_row": r,
             "datetime": str(time_val or "").strip(),
-            "tx_code": str(code_val or "").strip(),
-            "tx_type": str(type_val or "").strip(),
+            "tx_code": code_str,
+            "tx_type": type_str,
             "amount": parse_amount(amount_val),
             "status": str(status_val or "").strip(),
-            "note_raw": str(note_val or "").strip(),
-            "pj_doc": pj_doc
+            "note_raw": note_str
         })
 
-    logger.info(f"อ่านไฟล์ Report สำเร็จ: {len(rows_data)} แถว")
+    logger.info(f"อ่านไฟล์ Report สำเร็จ: พบรายการที่มีเลขที่บิล {len(rows_data)} แถว")
     return rows_data
 
 
-def read_master_file(filepath):
+def process_matching(report_rows, master_rows, master_lookup):
     """
-    อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
-    รองรับการถอดรหัสภาษาไทย CP874 จาก Excel 97-2003
-    สกัด: เลขที่เอกสาร (Col B - PJ...), ชื่อลูกหนี้ (Col D), มูลค่าสุทธิ (Col M)
-    """
-    if filepath.lower().endswith(".xls"):
-        try:
-            wb = xlrd.open_workbook(filepath, encoding_override="cp874")
-        except Exception:
-            wb = xlrd.open_workbook(filepath)
-        sh = wb.sheet_by_index(0)
-
-        master_data = {}
-        for r in range(sh.nrows):
-            if sh.ncols < 2:
-                continue
-
-            doc_cell = sh.cell_value(r, 1)  # Col B
-            doc_str = str(doc_cell).strip()
-            norm_doc = normalize_doc_no(doc_str)
-
-            if norm_doc.startswith("PJ"):
-                cust_name = str(sh.cell_value(r, 3)).strip() if sh.ncols > 3 else ""
-                val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
-                val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
-
-                master_data[norm_doc] = {
-                    "master_row": r + 1,
-                    "doc_no_raw": doc_str,
-                    "customer_name": cust_name,
-                    "val_before": val_before,
-                    "val_net": val_net
-                }
-    else:
-        wb = openpyxl.load_workbook(filepath, data_only=True)
-        ws = wb.active
-        master_data = {}
-        for r in range(1, ws.max_row + 1):
-            doc_cell = ws.cell(r, 2).value  # Col B
-            doc_str = str(doc_cell or "").strip()
-            norm_doc = normalize_doc_no(doc_str)
-
-            if norm_doc.startswith("PJ"):
-                cust_name = str(ws.cell(r, 4).value or "").strip()
-                val_before = parse_amount(ws.cell(r, 9).value)
-                val_net = parse_amount(ws.cell(r, 13).value)
-
-                master_data[norm_doc] = {
-                    "master_row": r,
-                    "doc_no_raw": doc_str,
-                    "customer_name": cust_name,
-                    "val_before": val_before,
-                    "val_net": val_net
-                }
-
-    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ทั้งหมด {len(master_data)} รายการ")
-    return master_data
-
-
-def process_matching(report_rows, master_dict):
-    """
-    ทำการ Match ข้อมูลระหว่าง Report และ Master:
-    - Match เลขที่เอกสาร PJ
+    ทำการ Match ข้อมูลระหว่าง Report และ Master (PJ, V, *V):
+    - Match เลขที่เอกสาร
     - ตรวจสอบยอดเงิน (Report ยอดเงิน Col D == Master มูลค่าสุทธิ Col M)
     """
     matched_list = []
     mismatch_list = []
     not_found_report = []
 
-    matched_master_keys = set()
+    matched_master_docs = set()
 
     for item in report_rows:
-        pj_key = item["pj_doc"]
+        note = item["note_raw"]
+        code = item["tx_code"]
+        amt = item["amount"]
+        r_num = item["report_row"]
 
-        if not pj_key:
-            continue
+        # สกัด Candidate Keys จากหมายเหตุ
+        candidates = []
+        if note:
+            candidates.append(note)
+            candidates.append(note.upper())
+            candidates.append(note.replace("*", ""))
+            candidates.append(note.split("/")[0])
+            tokens = re.findall(r"(\*?[A-Za-z]?\d+(?:/\d+)?)", note)
+            for t in tokens:
+                candidates.append(t)
+                candidates.append(t.upper())
+                candidates.append(t.replace("*", "").split("/")[0])
+                m_dig = re.search(r"(\d{4,})", t)
+                if m_dig:
+                    digits = m_dig.group(1)
+                    candidates.append(digits)
+                    candidates.append(f"PJ{digits}")
+                    candidates.append(f"V{digits}")
+                    candidates.append(f"*V{digits}")
+        if code:
+            candidates.append(code)
 
-        if pj_key in master_dict:
-            m_info = master_dict[pj_key]
-            matched_master_keys.add(pj_key)
+        # ค้นหาใน master_lookup
+        m_info = None
+        for cand in candidates:
+            if cand in master_lookup:
+                m_info = master_lookup[cand]
+                break
 
-            rep_amt = item["amount"]
-            mast_amt = m_info["val_net"]
-            diff = round(rep_amt - mast_amt, 2)
+        if m_info:
+            doc_key = m_info["doc_no_raw"]
+            matched_master_docs.add(doc_key)
+            diff = round(amt - m_info["val_net"], 2)
 
             detail = {
-                "Report แถว": item["report_row"],
+                "Report แถว": r_num,
                 "วันเวลาใน Report": item["datetime"],
-                "เลขที่บิล (PJ)": pj_key,
-                "หมายเหตุ Report": item["note_raw"],
-                "ยอดเงิน Report (Col D)": rep_amt,
+                "เลขที่บิลที่สกัดได้": doc_key,
+                "หมายเหตุ Report": note,
+                "ยอดเงิน Report (Col D)": amt,
                 "Master แถว": m_info["master_row"],
-                "เลขที่เอกสาร Master (Col B)": m_info["doc_no_raw"],
+                "เลขที่เอกสาร Master (Col B)": doc_key,
                 "ชื่อลูกค้า Master (Col D)": m_info["customer_name"],
-                "มูลค่าสุทธิ Master (Col M)": mast_amt,
+                "มูลค่าสุทธิ Master (Col M)": m_info["val_net"],
                 "ผลต่าง (Report - Master)": diff,
             }
 
@@ -294,27 +333,33 @@ def process_matching(report_rows, master_dict):
                 matched_list.append(detail)
             else:
                 detail["สถานะ"] = "ยอดเงินไม่ตรงกัน"
-                detail["หมายเหตุปัญหา"] = f"ยอดเงินใน Report ({rep_amt:,.2f}) ไม่ตรงกับ Master ({mast_amt:,.2f})"
+                detail["หมายเหตุปัญหา"] = f"ยอดเงินใน Report ({amt:,.2f}) ไม่ตรงกับ Master ({m_info['val_net']:,.2f})"
                 mismatch_list.append(detail)
         else:
-            detail = {
-                "Report แถว": item["report_row"],
-                "วันเวลาใน Report": item["datetime"],
-                "เลขที่บิลที่สกัดได้": pj_key,
-                "หมายเหตุ Report (ดิบ)": item["note_raw"],
-                "ยอดเงิน Report (Col D)": item["amount"],
-                "สถานะ": "ไม่พบใน Master",
-                "หมายเหตุปัญหา": f"ไม่พบรหัส {pj_key} ในไฟล์ Master"
-            }
-            not_found_report.append(detail)
+            # ไม่พบใน Master
+            m_check = re.search(r"\d{4,}", note)
+            if m_check:
+                disp_doc = note.split()[0]
+                if not any(disp_doc.upper().startswith(p) for p in ("PJ", "V", "*V")):
+                    disp_doc = f"PJ{disp_doc}" if len(disp_doc) >= 6 else disp_doc
+                not_found_report.append({
+                    "Report แถว": r_num,
+                    "วันเวลาใน Report": item["datetime"],
+                    "เลขที่บิลที่สกัดได้": disp_doc,
+                    "หมายเหตุ Report (ดิบ)": note,
+                    "ยอดเงิน Report (Col D)": amt,
+                    "สถานะ": "ไม่พบใน Master",
+                    "หมายเหตุปัญหา": f"ไม่พบรหัส {disp_doc} ในไฟล์ Master"
+                })
 
-    # ค้นหาเอกสารใน Master ที่ไม่มีใน Report
+    # ค้นหาเอกสารใน Master (PJ, V, *V) ที่ไม่มีใน Report
     not_in_report = []
-    for doc_no, m_info in master_dict.items():
-        if doc_no not in matched_master_keys:
+    for m_info in master_rows:
+        doc_no = m_info["doc_no_raw"]
+        if doc_no not in matched_master_docs:
             not_in_report.append({
                 "Master แถว": m_info["master_row"],
-                "เลขที่เอกสาร Master (Col B)": m_info["doc_no_raw"],
+                "เลขที่เอกสาร Master (Col B)": doc_no,
                 "ชื่อลูกค้า Master (Col D)": m_info["customer_name"],
                 "มูลค่าสุทธิ Master (Col M)": m_info["val_net"],
                 "สถานะ": "ไม่มีใน Report"
@@ -326,7 +371,7 @@ def process_matching(report_rows, master_dict):
         "not_found_report": not_found_report,
         "not_in_report": not_in_report,
         "total_report_pj": len(matched_list) + len(mismatch_list) + len(not_found_report),
-        "total_master_pj": len(master_dict)
+        "total_master_pj": len(master_rows)
     }
 
 
@@ -347,7 +392,6 @@ def style_excel_sheet(ws, title_color="1F4E79"):
         bottom=Side(style="thin", color="D9D9D9")
     )
 
-    # Style Header Row
     for col in range(1, ws.max_column + 1):
         cell = ws.cell(1, col)
         cell.font = header_font
@@ -356,7 +400,6 @@ def style_excel_sheet(ws, title_color="1F4E79"):
         cell.border = thin_border
     ws.row_dimensions[1].height = 28
 
-    # Style Data Rows
     for r in range(2, ws.max_row + 1):
         ws.row_dimensions[r].height = 20
         for c in range(1, ws.max_column + 1):
@@ -375,7 +418,6 @@ def style_excel_sheet(ws, title_color="1F4E79"):
             else:
                 cell.alignment = align_left
 
-    # Auto-adjust column widths
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
         max_len = 0
@@ -388,18 +430,17 @@ def style_excel_sheet(ws, title_color="1F4E79"):
 
 
 def create_result_excel(result, report_name, master_name, output_path="match_result.xlsx"):
-    """สร้างไฟล์ match_result.xlsx ที่มีหลายชีต ครอบคลุมทั้งสรุปผลและรายละเอียด"""
+    """สร้างไฟล์ Excel สรุปผล ที่มีหลายชีต ครอบคลุมทั้งสรุปผลและรายละเอียด"""
     wb = openpyxl.Workbook()
 
-    # --- Sheet 1: สรุปภาพรวม (Summary) ---
+    # --- Sheet 1: สรุปภาพรวม ---
     ws_summary = wb.active
     ws_summary.title = "สรุปภาพรวม"
     ws_summary.views.sheetView[0].showGridLines = True
 
-    # Title Banner
     ws_summary.merge_cells("A1:D1")
     title_cell = ws_summary["A1"]
-    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงินประจำวัน"
+    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงิน (PJ, V, *V)"
     title_cell.font = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF")
     title_cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -408,7 +449,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
     summary_rows = [
         ("วันที่ประมวลผล", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
         ("ไฟล์ Report (รายการรับชำระเงิน)", os.path.basename(report_name)),
-        ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้)", os.path.basename(master_name)),
+        ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้ PJ, V, *V)", os.path.basename(master_name)),
         ("──────────────────────────────", "──────────────────"),
         ("1. ข้อมูลที่ตรงกันสมบูรณ์ (Matched)", len(result["matched"])),
         ("2. ข้อมูลที่ยอดเงินไม่ตรงกัน (Mismatch)", len(result["mismatched"])),
@@ -416,7 +457,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
         ("รวมรายการ Report ที่ตรวจเช็คทั้งหมด", result["total_report_pj"]),
         ("──────────────────────────────", "──────────────────"),
         ("4. บิลใน Master ที่ยังไม่มีใน Report", len(result["not_in_report"])),
-        ("รวมบิล PJ ใน Master ทั้งหมด", result["total_master_pj"]),
+        ("รวมบิล Master (PJ, V, *V) ทั้งหมด", result["total_master_pj"]),
     ]
 
     for idx, (label, val) in enumerate(summary_rows, start=3):
@@ -432,7 +473,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
     ws_summary.cell(8, 2).fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
     ws_summary.cell(9, 2).fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
-    ws_summary.column_dimensions["A"].width = 42
+    ws_summary.column_dimensions["A"].width = 45
     ws_summary.column_dimensions["B"].width = 35
 
     def add_data_sheet(sheet_name, data_list, title_color):
@@ -470,7 +511,6 @@ def send_telegram(summary_text, file_path=None, chat_id=None):
         logger.warning("⚠️ ไม่พบ TELEGRAM_TOKEN หรือ TELEGRAM_CHAT_ID ในระบบ")
         return False
 
-    # 1. ส่งข้อความสรุป
     msg_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": target_chat,
@@ -487,7 +527,6 @@ def send_telegram(summary_text, file_path=None, chat_id=None):
         logger.error(f"เกิดข้อผิดพลาดในการส่งข้อความ Telegram: {e}")
         return False
 
-    # 2. ส่งไฟล์ Excel (ถ้ามี)
     if file_path and os.path.exists(file_path):
         doc_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
         try:
@@ -496,7 +535,7 @@ def send_telegram(summary_text, file_path=None, chat_id=None):
                     doc_url,
                     data={
                         "chat_id": target_chat,
-                        "caption": f"📄 รายงานฉบับเต็มประจำวัน: {os.path.basename(file_path)}"
+                        "caption": f"📄 รายงานฉบับเต็ม: {os.path.basename(file_path)}"
                     },
                     files={"document": f},
                     timeout=60
@@ -518,7 +557,6 @@ def upload_to_google_drive(file_path):
     service_account_json = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
     filename = os.path.basename(file_path)
 
-    # 1. วิธีที่ 1: ผ่าน Google Apps Script Web App (วิธีที่สะดวกและง่ายที่สุด)
     if upload_url:
         logger.info(f"กำลังอัปโหลด {filename} ไปยัง Google Drive ผ่าน Web App...")
         try:
@@ -534,7 +572,6 @@ def upload_to_google_drive(file_path):
         except Exception as e:
             logger.error(f"เกิดข้อผิดพลาดในการอัปโหลดผ่าน Web App: {e}")
 
-    # 2. วิธีที่ 2: ผ่าน Google Service Account JSON
     elif service_account_json:
         logger.info(f"กำลังอัปโหลด {filename} ไปยัง Google Drive ผ่าน Service Account...")
         try:
@@ -570,41 +607,40 @@ def upload_to_google_drive(file_path):
             logger.error(f"เกิดข้อผิดพลาดในการอัปโหลดผ่าน Service Account: {e}")
     else:
         logger.info(
-            f"ℹ️ ไฟล์ '{filename}' ถูกบันทึกไว้ในเครื่องเรียบร้อยแล้ว\n"
+            f"ℹ️ ไฟล์ '{filename}' ถูกบันทึกไว้ในระบบเรียบร้อยแล้ว\n"
             f"(หากต้องการให้อัปโหลดเข้า Google Drive อัตโนมัติ สามารถเพิ่ม GDRIVE_UPLOAD_URL ใน Secrets)"
         )
 
     return False
 
 
-def run_matching_job(chat_id=None):
-    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลักแบบรอบเดียว (One-off Job)"""
-    logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล ===")
+def run_matching_job(report_file=None, master_file=None, chat_id=None):
+    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลัก (รองรับ PJ, V, *V)"""
+    logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล (PJ, V, *V) ===")
     target_chat = chat_id or TELEGRAM_CHAT_ID
 
     # 1. ดาวน์โหลดไฟล์จาก Google Drive
     download_dir = download_drive_folder()
 
-    # 2. ค้นหาไฟล์ Report และไฟล์ Master ล่าสุด
-    report_file, master_file = find_target_files([download_dir, "."])
+    # 2. ค้นหาไฟล์ Report และไฟล์ Master
+    if not report_file or not master_file:
+        report_file, master_file = find_target_files([download_dir, "."])
 
     # 3. อ่านและเตรียมข้อมูล
     report_rows = read_report_file(report_file)
-    master_dict = read_master_file(master_file)
+    master_rows, master_lookup = read_master_file(master_file)
 
-    # 4. ทำการ Match ข้อมูล
-    result = process_matching(report_rows, master_dict)
+    # 4. ทำการ Match ข้อมูล (PJ, V, *V)
+    result = process_matching(report_rows, master_rows, master_lookup)
 
-    # 5. สร้างไฟล์ Excel สรุปผล โดยตั้งชื่อเป็น match_result_ตามด้วยวันที่.xlsx
-    import shutil
+    # 5. สร้างไฟล์ Excel สรุปผล
     date_str = datetime.now().strftime("%Y%m%d")
     output_excel = f"match_result_{date_str}.xlsx"
     create_result_excel(result, report_file, master_file, output_excel)
 
-    # ทำสำเนาเป็น match_result.xlsx ไว้ด้วย
     shutil.copyfile(output_excel, "match_result.xlsx")
 
-    # 6. อัปโหลดไฟล์ผลลัพธ์เข้า Google Drive
+    # 6. อัปโหลดเข้า Google Drive (ถ้ามีการตั้งค่า)
     upload_to_google_drive(output_excel)
 
     # 7. เตรียมข้อความสรุป
@@ -615,7 +651,7 @@ def run_matching_job(chat_id=None):
     n_not_in_rep = len(result["not_in_report"])
 
     summary_msg = (
-        f"📊 *รายงานสรุปการ Match ข้อมูลประจำวัน*\n"
+        f"📊 *รายงานสรุปการ Match ข้อมูลประจำวัน (PJ, V, *V)*\n"
         f"📅 ประมวลผลเมื่อ: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         f"────────────────────────\n"
         f"📁 *Report:* `{os.path.basename(report_file)}`\n"
@@ -625,7 +661,7 @@ def run_matching_job(chat_id=None):
         f"⚠️ *ยอดเงินไม่ตรงกัน:* {n_mismatch} แถว\n"
         f"🔍 *ไม่พบใน Master:* {n_not_found} แถว\n"
         f"📋 *รวมรายการที่ตรวจเช็ค:* {n_total_report} แถว\n\n"
-        f"📌 *บิล Master ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
+        f"📌 *บิล Master (PJ/V/*V) ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
         f"────────────────────────\n"
         f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วครับ*"
     )
@@ -639,18 +675,13 @@ def run_matching_job(chat_id=None):
 
 
 def start_telegram_listener():
-    """
-    โหมดรันเป็น Bot Listener ตลอดเวลา:
-    คอยรับข้อความใน Telegram เมื่อผู้ใช้พิมพ์คำว่า "Match Data" (หรือ /match)
-    จะสั่งรันประมวลผลและตอบกลับรายงานพร้อมไฟล์ Excel ทันที
-    """
-    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง 'Match Data'...")
+    """โหมดรันเป็น Bot Listener ตลอดเวลา รองรับคำสั่ง Match Data"""
+    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง 'Match Data' (PJ, V, *V)...")
     offset = None
 
-    # ส่งข้อความแจ้งผู้ใช้ว่าบอทออนไลน์แล้ว
     send_telegram(
         "🤖 *บอท Ploy(Accounting) ออนไลน์แล้วครับ!*\n\n"
-        "พิมพ์คำว่า *Match Data* เพื่อสั่งให้ตรวจสอบและจับคู่ข้อมูลยอดเงินทันที",
+        "พิมพ์คำว่า *Match Data* เพื่อสั่งให้ตรวจสอบและจับคู่ข้อมูลยอดเงิน (PJ, V, *V) ทันที",
         chat_id=TELEGRAM_CHAT_ID
     )
 
@@ -686,11 +717,10 @@ def start_telegram_listener():
                 logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
 
                 text_lower = text.lower()
-                # ตรวจจับคำสั่ง Match Data
                 if text_lower in ("match data", "matchdata", "match", "/match"):
                     send_telegram(
                         "⏳ *ได้รับคำสั่ง Match Data เรียบร้อยแล้ว!*\n"
-                        "กำลังดาวน์โหลดไฟล์จาก Google Drive และประมวลผลข้อมูล กรุณารอสักครู่...",
+                        "กำลังดาวน์โหลดไฟล์และประมวลผลข้อมูล (PJ, V, *V) กรุณารอสักครู่...",
                         chat_id=chat_id
                     )
                     try:
@@ -701,7 +731,7 @@ def start_telegram_listener():
 
                 elif text_lower in ("/start", "/help"):
                     send_telegram(
-                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล*\n\n"
+                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V, *V)*\n\n"
                         "💡 *คำสั่งที่รองรับ:*\n"
                         "• พิมพ์คำว่า *Match Data* เพื่อเริ่มการตรวจสอบข้อมูลทันที\n"
                         "• หรือกดปุ่มรันผ่าน GitHub Actions ได้ตลอดเวลาครับ",
@@ -717,11 +747,13 @@ def start_telegram_listener():
 
 
 def main():
-    # ตรวจสอบว่าผู้ใช้สั่งให้รันโหมด Listener หรือรันแบบรอบเดียว
     if "--listen" in sys.argv or "-l" in sys.argv:
         start_telegram_listener()
     else:
-        run_matching_job()
+        # ตรวจสอบว่ามีการระบุชื่อไฟล์ผ่าน argument หรือไม่
+        rep_file = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
+        mast_file = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else None
+        run_matching_job(report_file=rep_file, master_file=mast_file)
 
 
 if __name__ == "__main__":
