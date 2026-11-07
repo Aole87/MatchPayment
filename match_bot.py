@@ -113,11 +113,41 @@ def parse_amount(val):
 def read_master_file(filepath):
     """
     อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
-    รองรับทั้งเอกสารประเภท PJ, V และ *V
-    และรองรับการถอดรหัสภาษาไทย CP874 จาก Excel 97-2003
+    แยกตารางค้นหาเป็น 2 กลุ่มอย่างชัดเจน:
+    1. กลุ่ม PJ (ใบขายสด/ใบเสร็จรับเงิน)
+    2. กลุ่ม V และ *V (ใบกำกับภาษี)
     """
     master_rows = []
-    master_lookup = {}
+    pj_master = {}
+    v_master = {}
+
+    def index_master_doc(info):
+        master_rows.append(info)
+        doc_raw = info["doc_no_raw"]
+        u = doc_raw.upper()
+
+        if u.startswith("PJ"):
+            clean = u.replace("PJ", "").strip()
+            pj_master[doc_raw] = info
+            pj_master[u] = info
+            pj_master[clean] = info
+            m_dig = re.search(r"(\d+)", clean)
+            if m_dig:
+                d = m_dig.group(1)
+                pj_master[d] = info
+                pj_master[f"PJ{d}"] = info
+        elif u.startswith("V") or u.startswith("*V"):
+            clean_star = u.replace("*", "")
+            v_master[doc_raw] = info
+            v_master[u] = info
+            v_master[clean_star] = info
+            m_slash = re.search(r"(\d+/\d+)", doc_raw)
+            if m_slash:
+                v_master[m_slash.group(1)] = info
+            m_v_num = re.search(r"V(\d+)", clean_star)
+            if m_v_num:
+                v_master[f"V{m_v_num.group(1)}"] = info
+                v_master[f"*V{m_v_num.group(1)}"] = info
 
     if filepath.lower().endswith(".xls"):
         try:
@@ -141,31 +171,13 @@ def read_master_file(filepath):
                 val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
                 val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
 
-                info = {
+                index_master_doc({
                     "master_row": r + 1,
                     "doc_no_raw": doc_raw,
                     "customer_name": cust_name,
                     "val_before": val_before,
                     "val_net": val_net
-                }
-                master_rows.append(info)
-
-                # ดัชนีสำหรับการค้นหา
-                clean_star = u.replace("*", "")
-                base_slash = clean_star.split("/")[0]
-
-                for k in [doc_raw, u, clean_star, base_slash]:
-                    master_lookup[k] = info
-
-                m_dig = re.search(r"(\d{4,})", doc_raw)
-                if m_dig:
-                    digits = m_dig.group(1)
-                    master_lookup[digits] = info
-                    if u.startswith("PJ"):
-                        master_lookup[f"PJ{digits}"] = info
-                    else:
-                        master_lookup[f"V{digits}"] = info
-                        master_lookup[f"*V{digits}"] = info
+                })
     else:
         wb = openpyxl.load_workbook(filepath, data_only=True)
         ws = wb.active
@@ -181,33 +193,16 @@ def read_master_file(filepath):
                 val_before = parse_amount(ws.cell(r, 9).value)
                 val_net = parse_amount(ws.cell(r, 13).value)
 
-                info = {
+                index_master_doc({
                     "master_row": r,
                     "doc_no_raw": doc_raw,
                     "customer_name": cust_name,
                     "val_before": val_before,
                     "val_net": val_net
-                }
-                master_rows.append(info)
+                })
 
-                clean_star = u.replace("*", "")
-                base_slash = clean_star.split("/")[0]
-
-                for k in [doc_raw, u, clean_star, base_slash]:
-                    master_lookup[k] = info
-
-                m_dig = re.search(r"(\d{4,})", doc_raw)
-                if m_dig:
-                    digits = m_dig.group(1)
-                    master_lookup[digits] = info
-                    if u.startswith("PJ"):
-                        master_lookup[f"PJ{digits}"] = info
-                    else:
-                        master_lookup[f"V{digits}"] = info
-                        master_lookup[f"*V{digits}"] = info
-
-    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ, V, *V ทั้งหมด {len(master_rows)} รายการ")
-    return master_rows, master_lookup
+    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ({len(pj_master)} คีย์), V/*V ({len(v_master)} คีย์) รวม {len(master_rows)} รายการ")
+    return master_rows, pj_master, v_master
 
 
 def read_report_file(filepath):
@@ -263,10 +258,12 @@ def read_report_file(filepath):
     return rows_data
 
 
-def process_matching(report_rows, master_rows, master_lookup):
+def process_matching(report_rows, master_rows, pj_master, v_master):
     """
-    ทำการ Match ข้อมูลระหว่าง Report และ Master (PJ, V, *V):
-    - Match เลขที่เอกสาร
+    ทำการ Match ข้อมูลระหว่าง Report และ Master:
+    แยกประเภทตามแบบที่ 1:
+    - ถ้าใน Report มีเครื่องหมาย '/' หรือมีตัวอักษร 'V', '*V' -> จับคู่เฉพาะกลุ่ม V และ *V
+    - ถ้าเป็นตัวเลขล้วน ไม่มี '/' หรือมี 'PJ' -> จับคู่เฉพาะกลุ่ม PJ เท่านั้น (ไม่จับคู่ข้ามกลุ่ม)
     - ตรวจสอบยอดเงิน (Report ยอดเงิน Col D == Master มูลค่าสุทธิ Col M)
     """
     matched_list = []
@@ -280,34 +277,38 @@ def process_matching(report_rows, master_rows, master_lookup):
         code = item["tx_code"]
         amt = item["amount"]
         r_num = item["report_row"]
+        u_code = code.upper()
 
-        # สกัด Candidate Keys จากหมายเหตุ
+        # แยกประเภท: ถ้ามีเครื่องหมาย '/' หรือ 'v', '*v' ให้ค้นหาเฉพาะในกลุ่ม V/*V
+        is_v_group = ("/" in note) or ("v" in note.lower()) or u_code.startswith("V") or u_code.startswith("*V")
+        target_dict = v_master if is_v_group else pj_master
+
         candidates = []
         if note:
             candidates.append(note)
             candidates.append(note.upper())
-            candidates.append(note.replace("*", ""))
-            candidates.append(note.split("/")[0])
-            tokens = re.findall(r"(\*?[A-Za-z]?\d+(?:/\d+)?)", note)
-            for t in tokens:
+            for t in re.split(r"[\s,]+", note):
+                t = t.strip()
+                if not t:
+                    continue
                 candidates.append(t)
                 candidates.append(t.upper())
-                candidates.append(t.replace("*", "").split("/")[0])
-                m_dig = re.search(r"(\d{4,})", t)
+                m_dig = re.search(r"(\d+)", t)
                 if m_dig:
-                    digits = m_dig.group(1)
-                    candidates.append(digits)
-                    candidates.append(f"PJ{digits}")
-                    candidates.append(f"V{digits}")
-                    candidates.append(f"*V{digits}")
+                    d = m_dig.group(1)
+                    candidates.append(d)
+                    if is_v_group:
+                        candidates.append(f"V{d}")
+                        candidates.append(f"*V{d}")
+                    else:
+                        candidates.append(f"PJ{d}")
         if code:
             candidates.append(code)
 
-        # ค้นหาใน master_lookup
         m_info = None
         for cand in candidates:
-            if cand in master_lookup:
-                m_info = master_lookup[cand]
+            if cand in target_dict:
+                m_info = target_dict[cand]
                 break
 
         if m_info:
@@ -336,12 +337,10 @@ def process_matching(report_rows, master_rows, master_lookup):
                 detail["หมายเหตุปัญหา"] = f"ยอดเงินใน Report ({amt:,.2f}) ไม่ตรงกับ Master ({m_info['val_net']:,.2f})"
                 mismatch_list.append(detail)
         else:
-            # ไม่พบใน Master
-            m_check = re.search(r"\d{4,}", note)
-            if m_check:
+            if re.search(r"\d{4,}", note):
                 disp_doc = note.split()[0]
-                if not any(disp_doc.upper().startswith(p) for p in ("PJ", "V", "*V")):
-                    disp_doc = f"PJ{disp_doc}" if len(disp_doc) >= 6 else disp_doc
+                if not is_v_group and not disp_doc.upper().startswith("PJ"):
+                    disp_doc = f"PJ{disp_doc}"
                 not_found_report.append({
                     "Report แถว": r_num,
                     "วันเวลาใน Report": item["datetime"],
@@ -352,7 +351,6 @@ def process_matching(report_rows, master_rows, master_lookup):
                     "หมายเหตุปัญหา": f"ไม่พบรหัส {disp_doc} ในไฟล์ Master"
                 })
 
-    # ค้นหาเอกสารใน Master (PJ, V, *V) ที่ไม่มีใน Report
     not_in_report = []
     for m_info in master_rows:
         doc_no = m_info["doc_no_raw"]
@@ -628,10 +626,10 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None):
 
     # 3. อ่านและเตรียมข้อมูล
     report_rows = read_report_file(report_file)
-    master_rows, master_lookup = read_master_file(master_file)
+    master_rows, pj_master, v_master = read_master_file(master_file)
 
-    # 4. ทำการ Match ข้อมูล (PJ, V, *V)
-    result = process_matching(report_rows, master_rows, master_lookup)
+    # 4. ทำการ Match ข้อมูล (PJ, V, *V ตามแบบที่ 1)
+    result = process_matching(report_rows, master_rows, pj_master, v_master)
 
     # 5. สร้างไฟล์ Excel สรุปผล
     date_str = datetime.now().strftime("%Y%m%d")
