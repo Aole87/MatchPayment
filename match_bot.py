@@ -53,10 +53,98 @@ def download_drive_folder(folder_url=None, output_dir="downloads"):
             return output_dir
 
 
-def find_target_files(search_dirs=None):
+class MissingPairError(Exception):
+    """ข้อยกเว้นเมื่อไฟล์ของวันล่าสุดยังมาไม่ครบทั้ง 2 ระบบ"""
+    pass
+
+
+def get_file_data_date(filepath):
     """
-    ค้นหาไฟล์ Report ล่าสุด และไฟล์ Master (เช่น 5-11.xls / 6-11.xls)
-    โดยรองรับการเปลี่ยนชื่อไฟล์ทุกวันอัตโนมัติ
+    ตรวจสอบวันที่จริงของข้อมูลในไฟล์:
+    - ถ้าเป็น Report: อ่านวันที่จากคอลัมน์ A (รองรับทั้งวันเดียว เช่น '05/11' และช่วงวัน เช่น '06-08/11')
+    - ถ้าเป็น Master: อ่านวันที่จากชื่อไฟล์ (เช่น 5-11.xls -> '05/11' หรือ 6-8-11.xls -> '06-08/11') หรือจากเนื้อหา
+    คืนค่าเป็น (date_str, sort_key) เช่น ('06-08/11', (11, 8))
+    """
+    fname = os.path.basename(filepath)
+    is_report = "report" in fname.lower()
+
+    if is_report:
+        try:
+            wb = openpyxl.load_workbook(filepath, data_only=True)
+            ws = wb.active
+            dates = []
+            for r in range(2, ws.max_row + 1):
+                val = ws.cell(r, 1).value
+                if val:
+                    m = re.search(r"(\d{1,2})/(\d{1,2})/\d{2,4}", str(val))
+                    if m:
+                        d, mth = int(m.group(1)), int(m.group(2))
+                        dates.append((mth, d))
+            if dates:
+                dates.sort()
+                min_mth, min_d = dates[0]
+                max_mth, max_d = dates[-1]
+                if min_mth == max_mth and min_d == max_d:
+                    return f"{min_d:02d}/{min_mth:02d}", (max_mth, max_d)
+                elif min_mth == max_mth:
+                    return f"{min_d:02d}-{max_d:02d}/{min_mth:02d}", (max_mth, max_d)
+                else:
+                    return f"{min_d:02d}/{min_mth:02d}-{max_d:02d}/{max_mth:02d}", (max_mth, max_d)
+        except Exception as e:
+            logger.warning(f"ไม่สามารถอ่านวันที่จากเซลล์ใน {fname}: {e}")
+
+        # สำรอง: ถอดจากชื่อไฟล์ Report_YYYYMMDD...
+        m_fn = re.search(r"Report_(\d{4})(\d{2})(\d{2})", fname, re.IGNORECASE)
+        if m_fn:
+            d, mth = int(m_fn.group(3)), int(m_fn.group(2))
+            return f"{d:02d}/{mth:02d}", (mth, d)
+
+    else:
+        # Master: ลองอ่านจากเนื้อหาตาราง Express ก่อน (เช่น แถว 'ระหว่างวันที่ 06/11/2569 ถึง 08/11/2569')
+        if filepath.lower().endswith(".xls"):
+            try:
+                sh = xlrd.open_workbook(filepath, encoding_override="cp874").sheet_by_index(0)
+                for r in range(min(sh.nrows, 20)):
+                    for c in range(min(sh.ncols, 5)):
+                        val = str(sh.cell_value(r, c))
+                        m_period = re.search(r"(\d{1,2})/(\d{1,2})/\d{2,4}\s+ถึง\s+(\d{1,2})/(\d{1,2})/\d{2,4}", val)
+                        if m_period:
+                            d1, m1, d2, m2 = int(m_period.group(1)), int(m_period.group(2)), int(m_period.group(3)), int(m_period.group(4))
+                            if d1 == d2 and m1 == m2:
+                                return f"{d1:02d}/{m1:02d}", (m2, d2)
+                            elif m1 == m2:
+                                return f"{d1:02d}-{d2:02d}/{m1:02d}", (m2, d2)
+                            else:
+                                return f"{d1:02d}/{m1:02d}-{d2:02d}/{m2:02d}", (m2, d2)
+
+                        m2 = re.search(r"(\d{1,2})/(\d{1,2})/\d{2,4}", val)
+                        if m2:
+                            d, mth = int(m2.group(1)), int(m2.group(2))
+                            return f"{d:02d}/{mth:02d}", (mth, d)
+            except Exception as e:
+                logger.warning(f"ไม่สามารถอ่านวันที่จากเซลล์ใน {fname}: {e}")
+
+        # สำรอง Master: ตรวจสอบช่วงวันที่ในชื่อไฟล์ เช่น 6-8-11.xls
+        m_rng = re.search(r"(\d{1,2})-(\d{1,2})-(\d{1,2})", fname)
+        if m_rng:
+            d1, d2, mth = int(m_rng.group(1)), int(m_rng.group(2)), int(m_rng.group(3))
+            return f"{d1:02d}-{d2:02d}/{mth:02d}", (mth, d2)
+
+        # สำรอง Master: ตรวจสอบวันเดี่ยว เช่น 5-11.xls, 6-11.xls
+        m_single = re.search(r"(\d{1,2})[-_](\d{1,2})", fname)
+        if m_single:
+            d, mth = int(m_single.group(1)), int(m_single.group(2))
+            return f"{d:02d}/{mth:02d}", (mth, d)
+
+    return None, (0, 0)
+
+
+def scan_and_group_files(search_dirs=None):
+    """
+    สแกนโฟลเดอร์และจัดกลุ่มไฟล์แยกตาม 'วันที่ของข้อมูล'
+    คืนค่าเป็น:
+      date_groups: dict เรียงจากวันล่าสุดไปเก่าสุด
+                   {'06/11': {'report': None, 'master': '...', 'sort_key': (11, 6)}, ...}
     """
     if os.path.exists("downloads") and any(f.lower().endswith((".xlsx", ".xls")) for f in os.listdir("downloads")):
         search_dirs = ["downloads"]
@@ -73,30 +161,143 @@ def find_target_files(search_dirs=None):
                     if name_lower.endswith((".xlsx", ".xls")) and not f.startswith("~$") and not name_lower.startswith("match_result"):
                         all_files.append(fp)
 
-    if not all_files:
+    date_groups = {}
+    for fp in all_files:
+        fname = os.path.basename(fp)
+        is_rep = "report" in fname.lower()
+        d_str, s_key = get_file_data_date(fp)
+        if not d_str:
+            d_str = "ไม่ทราบวันที่"
+            s_key = (0, 0)
+
+        if d_str not in date_groups:
+            date_groups[d_str] = {"report": None, "master": None, "sort_key": s_key}
+
+        if is_rep:
+            curr = date_groups[d_str]["report"]
+            if not curr or os.path.getmtime(fp) > os.path.getmtime(curr):
+                date_groups[d_str]["report"] = fp
+        else:
+            curr = date_groups[d_str]["master"]
+            if not curr or os.path.getmtime(fp) > os.path.getmtime(curr):
+                date_groups[d_str]["master"] = fp
+
+    # เรียงลำดับตามวันที่ล่าสุด (sort_key = (month, day))
+    sorted_groups = dict(sorted(date_groups.items(), key=lambda item: item[1]["sort_key"], reverse=True))
+    return sorted_groups
+
+
+def check_files_status(chat_id=None):
+    """
+    ตรวจสอบสถานะความพร้อมของไฟล์ใน Google Drive
+    แล้วส่งรายงานสรุปให้ผู้ใช้ทราบว่าวันไหนพร้อม วันไหนขาดไฟล์อะไร
+    """
+    download_dir = download_drive_folder()
+    date_groups = scan_and_group_files([download_dir, "."])
+
+    if not date_groups:
+        msg = "⚠️ *ไม่พบไฟล์ Excel ในระบบเลยครับ* กรุณาอัปโหลดไฟล์เข้า Google Drive"
+        send_telegram(msg, chat_id=chat_id)
+        return msg
+
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+    lines = [
+        "📂 *ผลการตรวจสอบไฟล์ใน Google Drive*",
+        f"🕒 ตรวจสอบเมื่อ: {now_str}",
+        "────────────────────────"
+    ]
+
+    has_ready = False
+    for d_str, info in date_groups.items():
+        rep = info["report"]
+        mast = info["master"]
+        lines.append(f"📅 *วันที่ข้อมูล: {d_str}*")
+
+        if mast:
+            lines.append(f"  • ฝั่ง Master: `{os.path.basename(mast)}` ✅")
+        else:
+            lines.append("  • ฝั่ง Master: ❌ *ยังไม่ส่งมา*")
+
+        if rep:
+            lines.append(f"  • ฝั่ง Report: `{os.path.basename(rep)}` ✅")
+        else:
+            lines.append("  • ฝั่ง Report: ❌ *ยังไม่ส่งมา*")
+
+        if mast and rep:
+            lines.append("  ➔ *สถานะ:* ✅ *พร้อมจับคู่เอกสาร*")
+            has_ready = True
+        elif mast and not rep:
+            lines.append("  ➔ *สถานะ:* ⏳ *รอไฟล์ Report เพื่อทำการจับคู่*")
+        elif rep and not mast:
+            lines.append("  ➔ *สถานะ:* ⏳ *รอไฟล์ Master เพื่อทำการจับคู่*")
+        lines.append("")
+
+    lines.append("────────────────────────")
+    if has_ready:
+        lines.append("💡 *พิมพ์คำว่า 'จับคู่เอกสาร' เพื่อเริ่มประมวลผลได้ทันทีครับ*")
+    else:
+        lines.append("💡 *เมื่ออีกระบบอัปโหลดไฟล์เข้ามาครบแล้ว สามารถพิมพ์ 'จับคู่เอกสาร' ได้ทันทีครับ*")
+
+    full_msg = "\n".join(lines)
+    print("\n" + full_msg + "\n")
+    send_telegram(full_msg, chat_id=chat_id)
+    return full_msg
+
+
+def find_target_files(search_dirs=None, target_date=None):
+    """
+    ค้นหาคู่ไฟล์ที่ตรงกันตาม 'วันที่ของข้อมูล' อย่างปลอดภัย:
+    1. หากระบุ target_date (เช่น '05/11') -> ดึงคู่วันที่นั้น
+    2. หากไม่ระบุ -> ดึงวันที่ล่าสุดที่สมบูรณ์ทั้ง 2 ฝั่ง
+       หากวันล่าสุดยังมีไฟล์แค่ระบบเดียว จะแจ้งเตือนให้รออย่างชัดเจน
+    """
+    date_groups = scan_and_group_files(search_dirs)
+
+    if not date_groups:
         raise FileNotFoundError("ไม่พบไฟล์ Excel ในโฟลเดอร์สำหรับประมวลผล")
 
-    report_candidates = [f for f in all_files if "report" in os.path.basename(f).lower()]
-    master_candidates = [f for f in all_files if "report" not in os.path.basename(f).lower()]
+    # กรณีระบุวันที่เจาะจง
+    if target_date:
+        m_t = re.search(r"(\d{1,2})[/-](\d{1,2})", target_date)
+        if m_t:
+            norm_date = f"{int(m_t.group(1)):02d}/{int(m_t.group(2)):02d}"
+        else:
+            norm_date = target_date
 
-    if not report_candidates:
-        raise FileNotFoundError("ไม่พบไฟล์ประเภท Report_*.xlsx")
-    if not master_candidates:
-        raise FileNotFoundError("ไม่พบไฟล์ประเภท Master (เช่น 5-11.xls)")
+        if norm_date not in date_groups:
+            raise FileNotFoundError(f"ไม่พบข้อมูลไฟล์ของวันที่ {target_date} ในระบบ")
 
-    def sort_key(filepath):
-        fname = os.path.basename(filepath)
-        mtime = os.path.getmtime(filepath)
-        nums = re.findall(r"\d+", fname)
-        num_score = int("".join(nums)) if nums else 0
-        return (mtime, num_score, fname)
+        info = date_groups[norm_date]
+        if not info["report"] or not info["master"]:
+            missing = "Report" if not info["report"] else "Master"
+            raise MissingPairError(f"ไฟล์ของวันที่ {norm_date} ยังไม่ครบ (ขาดไฟล์ {missing})")
+        return info["report"], info["master"], norm_date
 
-    latest_report = max(report_candidates, key=sort_key)
-    latest_master = max(master_candidates, key=sort_key)
+    # กรณีไม่ระบุวันที่: ตรวจสอบวันล่าสุด
+    dates_list = list(date_groups.keys())
+    latest_date = dates_list[0]
+    latest_info = date_groups[latest_date]
 
-    logger.info(f"ไฟล์ Report ที่เลือก: {latest_report}")
-    logger.info(f"ไฟล์ Master ที่เลือก: {latest_master}")
-    return latest_report, latest_master
+    # ถ้าวันล่าสุดมีครบทั้ง 2 ไฟล์ -> ดำเนินการได้เลย
+    if latest_info["report"] and latest_info["master"]:
+        logger.info(f"พบคู่ไฟล์สมบูรณ์ของวันล่าสุด {latest_date}: Report={latest_info['report']}, Master={latest_info['master']}")
+        return latest_info["report"], latest_info["master"], latest_date
+
+    # ถ้าวันล่าสุดมีแค่ 1 ระบบ -> แจ้งเตือนว่ากำลังรออีกระบบ
+    present = "Master" if latest_info["master"] else "Report"
+    missing = "Report" if latest_info["master"] else "Master"
+    present_file = os.path.basename(latest_info["master"] or latest_info["report"])
+
+    # ตรวจสอบดูว่ามีวันก่อนหน้าที่มีไฟล์ครบหรือไม่
+    ready_dates = [d for d, inf in date_groups.items() if inf["report"] and inf["master"]]
+    ready_hint = f"\n*(💡 วันที่พร้อมจับคู่ตอนนี้คือ {ready_dates[0]} สามารถพิมพ์ 'จับคู่เอกสาร {ready_dates[0]}' ได้ครับ)*" if ready_dates else ""
+
+    err_msg = (
+        f"พบไฟล์ {present} วันที่ {latest_date} (`{present_file}`) แล้ว\n"
+        f"แต่ยังขาดไฟล์ {missing} ของวันที่ {latest_date} ครับ\n"
+        f"⏳ กรุณารออีกระบบอัปโหลดไฟล์ {missing} แล้วส่งคำสั่ง 'จับคู่เอกสาร' อีกครั้ง{ready_hint}"
+    )
+    raise MissingPairError(err_msg)
 
 
 def parse_amount(val):
@@ -612,17 +813,32 @@ def upload_to_google_drive(file_path):
     return False
 
 
-def run_matching_job(report_file=None, master_file=None, chat_id=None):
-    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลัก (รองรับ PJ, V, *V)"""
+def run_matching_job(report_file=None, master_file=None, chat_id=None, target_date=None):
+    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลัก (รองรับ PJ, V, *V ตามแบบที่ 1)"""
     logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล (PJ, V, *V) ===")
     target_chat = chat_id or TELEGRAM_CHAT_ID
 
     # 1. ดาวน์โหลดไฟล์จาก Google Drive
     download_dir = download_drive_folder()
 
-    # 2. ค้นหาไฟล์ Report และไฟล์ Master
+    # 2. ค้นหาไฟล์ Report และไฟล์ Master ตามวันที่ของข้อมูลจริง
+    matched_date_str = None
     if not report_file or not master_file:
-        report_file, master_file = find_target_files([download_dir, "."])
+        try:
+            report_file, master_file, matched_date_str = find_target_files([download_dir, "."], target_date=target_date)
+        except MissingPairError as me:
+            logger.warning(f"ไฟล์ยังไม่พร้อมจับคู่: {me}")
+            warn_msg = (
+                f"⚠️ *ยังไม่สามารถจับคู่เอกสารได้*\n\n"
+                f"{str(me)}\n\n"
+                f"💡 *สามารถพิมพ์ 'ตรวจสอบไฟล์' เพื่อดูสถานะไฟล์ทั้งหมดใน Google Drive ได้ครับ*"
+            )
+            send_telegram(warn_msg, chat_id=target_chat)
+            return None
+        except Exception as fe:
+            logger.error(f"ไม่สามารถค้นหาคู่ไฟล์ได้: {fe}")
+            send_telegram(f"❌ *ไม่สามารถค้นหาคู่ไฟล์ได้:*\n`{str(fe)}`", chat_id=target_chat)
+            return None
 
     # 3. อ่านและเตรียมข้อมูล
     report_rows = read_report_file(report_file)
@@ -648,8 +864,9 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None):
     n_total_report = result["total_report_pj"]
     n_not_in_rep = len(result["not_in_report"])
 
+    date_tag = f" (ข้อมูลวันที่ {matched_date_str})" if matched_date_str else ""
     summary_msg = (
-        f"📊 *รายงานสรุปการ Match ข้อมูลประจำวัน (PJ, V, *V)*\n"
+        f"📊 *รายงานสรุปการจับคู่เอกสาร (PJ, V, *V)*{date_tag}\n"
         f"📅 ประมวลผลเมื่อ: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         f"────────────────────────\n"
         f"📁 *Report:* `{os.path.basename(report_file)}`\n"
@@ -673,13 +890,16 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None):
 
 
 def start_telegram_listener():
-    """โหมดรันเป็น Bot Listener ตลอดเวลา รองรับคำสั่ง Match Data"""
-    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง 'Match Data' (PJ, V, *V)...")
+    """โหมดรันเป็น Bot Listener ตลอดเวลา รองรับคำสั่ง 'ตรวจสอบไฟล์' และ 'จับคู่เอกสาร'"""
+    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง...")
     offset = None
 
     send_telegram(
         "🤖 *บอท Ploy(Accounting) ออนไลน์แล้วครับ!*\n\n"
-        "พิมพ์คำว่า *Match Data* เพื่อสั่งให้ตรวจสอบและจับคู่ข้อมูลยอดเงิน (PJ, V, *V) ทันที",
+        "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
+        "• *ตรวจสอบไฟล์* ➔ เช็คดูว่าใน Google Drive มีไฟล์วันไหนบ้าง และระบบไหนส่งมาแล้วบ้าง\n"
+        "• *จับคู่เอกสาร* ➔ สั่งให้ระบบจับคู่และส่งรายงาน Excel เข้า Telegram ทันที\n"
+        "• *จับคู่เอกสาร [วันที่]* ➔ เจาะจงจับคู่ของวันที่ต้องการ (เช่น `จับคู่เอกสาร 05/11`)",
         chat_id=TELEGRAM_CHAT_ID
     )
 
@@ -713,26 +933,42 @@ def start_telegram_listener():
                 text = str(msg.get("text", "")).strip()
 
                 logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
+                text_clean = text.lower().strip()
 
-                text_lower = text.lower()
-                if text_lower in ("match data", "matchdata", "match", "/match"):
+                # คำสั่ง: ตรวจสอบไฟล์ (status, check)
+                if any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check")):
+                    send_telegram("⏳ *กำลังตรวจสอบไฟล์ใน Google Drive กรุณารอสักครู่...*", chat_id=chat_id)
+                    try:
+                        check_files_status(chat_id=chat_id)
+                    except Exception as err:
+                        logger.error(f"เกิดข้อผิดพลาดในการตรวจสอบไฟล์: {err}", exc_info=True)
+                        send_telegram(f"❌ *เกิดข้อผิดพลาดในการตรวจสอบไฟล์:*\n`{str(err)}`", chat_id=chat_id)
+
+                # คำสั่ง: จับคู่เอกสาร (match data, match)
+                elif any(k in text_clean for k in ("จับคู่เอกสาร", "จับคู่ข้อมูล", "จับคู่", "match data", "matchdata", "match", "/match")):
+                    # ตรวจสอบว่ามีการระบุวันที่หรือไม่ เช่น "จับคู่เอกสาร 05/11" หรือ "จับคู่ 5-11"
+                    m_d = re.search(r"(\d{1,2})[/-](\d{1,2})", text)
+                    req_date = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}" if m_d else None
+
+                    date_text = f" ของวันที่ {req_date}" if req_date else ""
                     send_telegram(
-                        "⏳ *ได้รับคำสั่ง Match Data เรียบร้อยแล้ว!*\n"
-                        "กำลังดาวน์โหลดไฟล์และประมวลผลข้อมูล (PJ, V, *V) กรุณารอสักครู่...",
+                        f"⏳ *ได้รับคำสั่ง จับคู่เอกสาร{date_text} เรียบร้อยแล้ว!*\n"
+                        "กำลังดาวน์โหลดไฟล์และตรวจสอบความพร้อม กรุณารอสักครู่...",
                         chat_id=chat_id
                     )
                     try:
-                        run_matching_job(chat_id=chat_id)
+                        run_matching_job(chat_id=chat_id, target_date=req_date)
                     except Exception as err:
                         logger.error(f"เกิดข้อผิดพลาดในการประมวลผล: {err}", exc_info=True)
                         send_telegram(f"❌ *เกิดข้อผิดพลาดในการประมวลผล:*\n`{str(err)}`", chat_id=chat_id)
 
-                elif text_lower in ("/start", "/help"):
+                elif text_clean in ("/start", "/help", "help", "คำสั่ง"):
                     send_telegram(
                         "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V, *V)*\n\n"
-                        "💡 *คำสั่งที่รองรับ:*\n"
-                        "• พิมพ์คำว่า *Match Data* เพื่อเริ่มการตรวจสอบข้อมูลทันที\n"
-                        "• หรือกดปุ่มรันผ่าน GitHub Actions ได้ตลอดเวลาครับ",
+                        "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
+                        "• *ตรวจสอบไฟล์* ➔ ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
+                        "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ\n"
+                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 05/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ครับ",
                         chat_id=chat_id
                     )
 
@@ -747,11 +983,19 @@ def start_telegram_listener():
 def main():
     if "--listen" in sys.argv or "-l" in sys.argv:
         start_telegram_listener()
+    elif "--check" in sys.argv or "--status" in sys.argv or "-c" in sys.argv:
+        check_files_status()
     else:
         # ตรวจสอบว่ามีการระบุชื่อไฟล์ผ่าน argument หรือไม่
-        rep_file = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
-        mast_file = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else None
-        run_matching_job(report_file=rep_file, master_file=mast_file)
+        rep_file = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and os.path.exists(sys.argv[1]) else None
+        mast_file = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") and os.path.exists(sys.argv[2]) else None
+        target_d = None
+        for arg in sys.argv[1:]:
+            m_d = re.search(r"^(\d{1,2})[/-](\d{1,2})$", arg)
+            if m_d:
+                target_d = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}"
+                break
+        run_matching_job(report_file=rep_file, master_file=mast_file, target_date=target_d)
 
 
 if __name__ == "__main__":
