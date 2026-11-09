@@ -316,16 +316,22 @@ def read_master_file(filepath):
     อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
     แยกตารางค้นหาเป็น 2 กลุ่มอย่างชัดเจน:
     1. กลุ่ม PJ (ใบขายสด/ใบเสร็จรับเงิน)
-    2. กลุ่ม V และ *V (ใบกำกับภาษี)
+    2. กลุ่ม V (ใบกำกับภาษี)
+    *หมายเหตุ: เอกสารที่เป็น *V หรือขึ้นต้นด้วย * (เอกสารยกเลิกใน Express) จะถูกคัดออก ไม่นำมา match*
     """
     master_rows = []
     pj_master = {}
     v_master = {}
 
     def index_master_doc(info):
-        master_rows.append(info)
         doc_raw = info["doc_no_raw"]
         u = doc_raw.upper()
+
+        # กรองเอกสารยกเลิก *V ออก ไม่นำมา match
+        if u.startswith("*"):
+            return
+
+        master_rows.append(info)
 
         if u.startswith("PJ"):
             clean = u.replace("PJ", "").strip()
@@ -337,18 +343,16 @@ def read_master_file(filepath):
                 d = m_dig.group(1)
                 pj_master[d] = info
                 pj_master[f"PJ{d}"] = info
-        elif u.startswith("V") or u.startswith("*V"):
-            clean_star = u.replace("*", "")
+        elif u.startswith("V"):
             v_master[doc_raw] = info
             v_master[u] = info
-            v_master[clean_star] = info
             m_slash = re.search(r"(\d+/\d+)", doc_raw)
             if m_slash:
                 v_master[m_slash.group(1)] = info
-            m_v_num = re.search(r"V(\d+)", clean_star)
+            m_v_num = re.search(r"V(\d+)", u)
             if m_v_num:
                 v_master[f"V{m_v_num.group(1)}"] = info
-                v_master[f"*V{m_v_num.group(1)}"] = info
+                v_master[m_v_num.group(1)] = info
 
     if filepath.lower().endswith(".xls"):
         try:
@@ -367,7 +371,11 @@ def read_master_file(filepath):
                 continue
 
             u = doc_raw.upper()
-            if u.startswith("PJ") or u.startswith("V") or u.startswith("*V"):
+            if u.startswith("*"):
+                # ข้ามเอกสาร *V หรือที่ขึ้นต้นด้วย *
+                continue
+
+            if u.startswith("PJ") or u.startswith("V"):
                 cust_name = str(sh.cell_value(r, 3)).strip() if sh.ncols > 3 else ""
                 val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
                 val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
@@ -389,7 +397,11 @@ def read_master_file(filepath):
                 continue
 
             u = doc_raw.upper()
-            if u.startswith("PJ") or u.startswith("V") or u.startswith("*V"):
+            if u.startswith("*"):
+                # ข้ามเอกสาร *V หรือที่ขึ้นต้นด้วย *
+                continue
+
+            if u.startswith("PJ") or u.startswith("V"):
                 cust_name = str(ws.cell(r, 4).value or "").strip()
                 val_before = parse_amount(ws.cell(r, 9).value)
                 val_net = parse_amount(ws.cell(r, 13).value)
@@ -402,7 +414,7 @@ def read_master_file(filepath):
                     "val_net": val_net
                 })
 
-    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ({len(pj_master)} คีย์), V/*V ({len(v_master)} คีย์) รวม {len(master_rows)} รายการ")
+    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ({len(pj_master)} คีย์), V ({len(v_master)} คีย์) รวม {len(master_rows)} รายการ (ไม่รวม *V)")
     return master_rows, pj_master, v_master
 
 
@@ -436,13 +448,13 @@ def read_report_file(filepath):
         if type_str in ("ปิดสิ้นวัน", "เติมเงินทอน", "ถอนเงิน", "นำเงินออกระหว่างวัน") and not note_str:
             continue
 
-        # ถ้าไม่มีหมายเหตุ และรหัสรายการไม่ได้ขึ้นต้นด้วย PJ, V, *V ให้ข้ามไป
+        # ถ้าไม่มีหมายเหตุ และรหัสรายการไม่ได้ขึ้นต้นด้วย PJ, V ให้ข้ามไป
         u_code = code_str.upper()
-        if not note_str and not any(u_code.startswith(p) for p in ("PJ", "V", "*V")):
+        if not note_str and not any(u_code.startswith(p) for p in ("PJ", "V")):
             continue
 
         # ตรวจสอบว่าใน note หรือ code มีตัวเลขบิลหรือไม่
-        if not re.search(r"\d{4,}", note_str) and not any(u_code.startswith(p) for p in ("PJ", "V", "*V")):
+        if not re.search(r"\d{4,}", note_str) and not any(u_code.startswith(p) for p in ("PJ", "V")):
             continue
 
         rows_data.append({
@@ -461,10 +473,10 @@ def read_report_file(filepath):
 
 def process_matching(report_rows, master_rows, pj_master, v_master):
     """
-    ทำการ Match ข้อมูลระหว่าง Report และ Master:
-    แยกประเภทตามแบบที่ 1:
-    - ถ้าใน Report มีเครื่องหมาย '/' หรือมีตัวอักษร 'V', '*V' -> จับคู่เฉพาะกลุ่ม V และ *V
-    - ถ้าเป็นตัวเลขล้วน ไม่มี '/' หรือมี 'PJ' -> จับคู่เฉพาะกลุ่ม PJ เท่านั้น (ไม่จับคู่ข้ามกลุ่ม)
+    ทำการ Match ข้อมูลระหว่าง Report และ Master (เหลือแค่ PJ กับ V ไม่รวม *V):
+    - ถ้าใน Report มีเครื่องหมาย '/' (เช่น 594378/69) หรือมีตัวอักษร V -> จับคู่เฉพาะกลุ่ม V
+    - ถ้าใน Report เป็นตัวเลขล้วน ไม่มี '/' (เช่น 594399, 1547564) หรือมี PJ -> จับคู่เฉพาะกลุ่ม PJ เท่านั้น (ไม่จับคู่ข้ามกับ V.../69)
+    - เอกสารที่เป็น *V (เอกสารยกเลิกใน Express) ถูกตัดออก ไม่นำมา match
     - ตรวจสอบยอดเงิน (Report ยอดเงิน Col D == Master มูลค่าสุทธิ Col M)
     """
     matched_list = []
@@ -480,8 +492,12 @@ def process_matching(report_rows, master_rows, pj_master, v_master):
         r_num = item["report_row"]
         u_code = code.upper()
 
-        # แยกประเภท: ถ้ามีเครื่องหมาย '/' หรือ 'v', '*v' ให้ค้นหาเฉพาะในกลุ่ม V/*V
-        is_v_group = ("/" in note) or ("v" in note.lower()) or u_code.startswith("V") or u_code.startswith("*V")
+        # ข้ามหากมีการระบุเป็น *V ใน Report
+        if note.strip().upper().startswith("*V") or u_code.startswith("*V"):
+            continue
+
+        # แยกประเภท: ถ้ามีเครื่องหมาย '/' หรือ 'v' ให้ค้นหาเฉพาะในกลุ่ม V
+        is_v_group = ("/" in note) or ("v" in note.lower()) or u_code.startswith("V")
         target_dict = v_master if is_v_group else pj_master
 
         candidates = []
@@ -500,7 +516,6 @@ def process_matching(report_rows, master_rows, pj_master, v_master):
                     candidates.append(d)
                     if is_v_group:
                         candidates.append(f"V{d}")
-                        candidates.append(f"*V{d}")
                     else:
                         candidates.append(f"PJ{d}")
         if code:
@@ -639,7 +654,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
 
     ws_summary.merge_cells("A1:D1")
     title_cell = ws_summary["A1"]
-    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงิน (PJ, V, *V)"
+    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงิน (PJ, V)"
     title_cell.font = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF")
     title_cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -648,7 +663,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
     summary_rows = [
         ("วันที่ประมวลผล", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
         ("ไฟล์ Report (รายการรับชำระเงิน)", os.path.basename(report_name)),
-        ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้ PJ, V, *V)", os.path.basename(master_name)),
+        ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้ PJ, V)", os.path.basename(master_name)),
         ("──────────────────────────────", "──────────────────"),
         ("1. ข้อมูลที่ตรงกันสมบูรณ์ (Matched)", len(result["matched"])),
         ("2. ข้อมูลที่ยอดเงินไม่ตรงกัน (Mismatch)", len(result["mismatched"])),
@@ -656,7 +671,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
         ("รวมรายการ Report ที่ตรวจเช็คทั้งหมด", result["total_report_pj"]),
         ("──────────────────────────────", "──────────────────"),
         ("4. บิลใน Master ที่ยังไม่มีใน Report", len(result["not_in_report"])),
-        ("รวมบิล Master (PJ, V, *V) ทั้งหมด", result["total_master_pj"]),
+        ("รวมบิล Master (PJ, V) ทั้งหมด", result["total_master_pj"]),
     ]
 
     for idx, (label, val) in enumerate(summary_rows, start=3):
@@ -814,8 +829,8 @@ def upload_to_google_drive(file_path):
 
 
 def run_matching_job(report_file=None, master_file=None, chat_id=None, target_date=None):
-    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลัก (รองรับ PJ, V, *V ตามแบบที่ 1)"""
-    logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล (PJ, V, *V) ===")
+    """ฟังก์ชันประมวลผลการ Match ข้อมูลหลัก (รองรับเฉพาะ PJ และ V ตามกฎใหม่ ไม่รวม *V)"""
+    logger.info("=== เริ่มต้นกระบวนการ Match ข้อมูล (PJ, V) ===")
     target_chat = chat_id or TELEGRAM_CHAT_ID
 
     # 1. ดาวน์โหลดไฟล์จาก Google Drive
@@ -844,7 +859,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
     report_rows = read_report_file(report_file)
     master_rows, pj_master, v_master = read_master_file(master_file)
 
-    # 4. ทำการ Match ข้อมูล (PJ, V, *V ตามแบบที่ 1)
+    # 4. ทำการ Match ข้อมูล (เฉพาะ PJ และ V)
     result = process_matching(report_rows, master_rows, pj_master, v_master)
 
     # 5. สร้างไฟล์ Excel สรุปผล
@@ -866,7 +881,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
 
     date_tag = f" (ข้อมูลวันที่ {matched_date_str})" if matched_date_str else ""
     summary_msg = (
-        f"📊 *รายงานสรุปการจับคู่เอกสาร (PJ, V, *V)*{date_tag}\n"
+        f"📊 *รายงานสรุปการจับคู่เอกสาร (PJ, V)*{date_tag}\n"
         f"📅 ประมวลผลเมื่อ: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         f"────────────────────────\n"
         f"📁 *Report:* `{os.path.basename(report_file)}`\n"
@@ -876,7 +891,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
         f"⚠️ *ยอดเงินไม่ตรงกัน:* {n_mismatch} แถว\n"
         f"🔍 *ไม่พบใน Master:* {n_not_found} แถว\n"
         f"📋 *รวมรายการที่ตรวจเช็ค:* {n_total_report} แถว\n\n"
-        f"📌 *บิล Master (PJ/V/*V) ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
+        f"📌 *บิล Master (PJ/V) ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
         f"────────────────────────\n"
         f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วครับ*"
     )
@@ -964,10 +979,10 @@ def start_telegram_listener():
 
                 elif text_clean in ("/start", "/help", "help", "คำสั่ง"):
                     send_telegram(
-                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V, *V)*\n\n"
+                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V)*\n\n"
                         "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
                         "• *ตรวจสอบไฟล์* ➔ ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
-                        "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ\n"
+                        "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ (เฉพาะบิล PJ และ V ไม่รวม *V)\n"
                         "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 05/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ครับ",
                         chat_id=chat_id
                     )
