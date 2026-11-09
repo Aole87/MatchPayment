@@ -313,28 +313,23 @@ def parse_amount(val):
 
 def read_master_file(filepath):
     """
-    อ่านไฟล์ 5-11.xls (หรือไฟล์ Master ประจำวัน)
-    แยกตารางค้นหาเป็น 2 กลุ่มอย่างชัดเจน:
-    1. กลุ่ม PJ (ใบขายสด/ใบเสร็จรับเงิน)
-    2. กลุ่ม V (ใบกำกับภาษี)
-    *หมายเหตุ: เอกสารที่เป็น *V หรือขึ้นต้นด้วย * (เอกสารยกเลิกใน Express) จะถูกคัดออก ไม่นำมา match*
+    อ่านไฟล์ Master ประจำวัน (เช่น 5-11.xls, 6-11.xls, 8-11.xls)
+    รับประกันว่าอ่านครบทุกแถวข้อมูล ไม่ให้มีแถวใดตกหล่น (รวมถึงแถวที่เป็น *PJ เช่น แถว 533):
+    1. กลุ่ม PJ และ *PJ: นำมาบันทึกใน master_rows และ pj_master เพื่อจับคู่กับบิลขายสด
+    2. กลุ่ม V: นำมาบันทึกใน master_rows และ v_master เพื่อจับคู่กับบิลภาษี
+    3. กลุ่ม *V: บันทึกใน master_rows (เพื่อให้รายงานครบทุกแถว) แต่ไม่ใส่ใน v_master เพื่อไม่ให้จับคู่กับยอดเงินตามคำสั่ง
     """
     master_rows = []
     pj_master = {}
     v_master = {}
 
     def index_master_doc(info):
+        master_rows.append(info)
         doc_raw = info["doc_no_raw"]
         u = doc_raw.upper()
 
-        # กรองเอกสารยกเลิก *V ออก ไม่นำมา match
-        if u.startswith("*"):
-            return
-
-        master_rows.append(info)
-
-        if u.startswith("PJ"):
-            clean = u.replace("PJ", "").strip()
+        if u.startswith("PJ") or u.startswith("*PJ"):
+            clean = u.replace("*", "").replace("PJ", "").strip()
             pj_master[doc_raw] = info
             pj_master[u] = info
             pj_master[clean] = info
@@ -343,6 +338,8 @@ def read_master_file(filepath):
                 d = m_dig.group(1)
                 pj_master[d] = info
                 pj_master[f"PJ{d}"] = info
+                pj_master[f"*PJ{d}"] = info
+
         elif u.startswith("V"):
             v_master[doc_raw] = info
             v_master[u] = info
@@ -353,6 +350,10 @@ def read_master_file(filepath):
             if m_v_num:
                 v_master[f"V{m_v_num.group(1)}"] = info
                 v_master[m_v_num.group(1)] = info
+
+        elif u.startswith("*V"):
+            # เอกสาร *V อยู่ใน master_rows เพื่อให้ครบทุกแถว แต่ไม่ใส่ใน v_master จึงไม่ถูกนำมา match
+            info["is_cancelled_v"] = True
 
     if filepath.lower().endswith(".xls"):
         try:
@@ -371,11 +372,7 @@ def read_master_file(filepath):
                 continue
 
             u = doc_raw.upper()
-            if u.startswith("*"):
-                # ข้ามเอกสาร *V หรือที่ขึ้นต้นด้วย *
-                continue
-
-            if u.startswith("PJ") or u.startswith("V"):
+            if u.startswith(("PJ", "*PJ", "V", "*V")):
                 cust_name = str(sh.cell_value(r, 3)).strip() if sh.ncols > 3 else ""
                 val_before = parse_amount(sh.cell_value(r, 8)) if sh.ncols > 8 else 0.0
                 val_net = parse_amount(sh.cell_value(r, 12)) if sh.ncols > 12 else 0.0
@@ -397,11 +394,7 @@ def read_master_file(filepath):
                 continue
 
             u = doc_raw.upper()
-            if u.startswith("*"):
-                # ข้ามเอกสาร *V หรือที่ขึ้นต้นด้วย *
-                continue
-
-            if u.startswith("PJ") or u.startswith("V"):
+            if u.startswith(("PJ", "*PJ", "V", "*V")):
                 cust_name = str(ws.cell(r, 4).value or "").strip()
                 val_before = parse_amount(ws.cell(r, 9).value)
                 val_net = parse_amount(ws.cell(r, 13).value)
@@ -414,7 +407,7 @@ def read_master_file(filepath):
                     "val_net": val_net
                 })
 
-    logger.info(f"อ่านไฟล์ Master สำเร็จ: พบเอกสาร PJ ({len(pj_master)} คีย์), V ({len(v_master)} คีย์) รวม {len(master_rows)} รายการ (ไม่รวม *V)")
+    logger.info(f"อ่านไฟล์ Master สำเร็จ: ครบทั้งหมด {len(master_rows)} รายการ (PJ/*PJ: {len(pj_master)} คีย์, V: {len(v_master)} คีย์)")
     return master_rows, pj_master, v_master
 
 
@@ -571,12 +564,13 @@ def process_matching(report_rows, master_rows, pj_master, v_master):
     for m_info in master_rows:
         doc_no = m_info["doc_no_raw"]
         if doc_no not in matched_master_docs:
+            st = "ไม่มีใน Report (*V เอกสารยกเลิก - ไม่นำมา match)" if m_info.get("is_cancelled_v") else "ไม่มีใน Report"
             not_in_report.append({
                 "Master แถว": m_info["master_row"],
                 "เลขที่เอกสาร Master (Col B)": doc_no,
                 "ชื่อลูกค้า Master (Col D)": m_info["customer_name"],
                 "มูลค่าสุทธิ Master (Col M)": m_info["val_net"],
-                "สถานะ": "ไม่มีใน Report"
+                "สถานะ": st
             })
 
     return {
@@ -654,7 +648,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
 
     ws_summary.merge_cells("A1:D1")
     title_cell = ws_summary["A1"]
-    title_cell.value = "📊 รายงานสรุปผลการ Match ข้อมูลยอดชำระเงิน (PJ, V)"
+    title_cell.value = "📊 รายงานสรุปผลการจับคู่ข้อมูลยอดชำระเงิน (น้องบิ๊นท์)"
     title_cell.font = Font(name="Segoe UI", size=14, bold=True, color="FFFFFF")
     title_cell.fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -662,6 +656,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
 
     summary_rows = [
         ("วันที่ประมวลผล", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
+        ("ผู้จัดทำรายงาน", "น้องบิ๊นท์ (Accounting Bot)"),
         ("ไฟล์ Report (รายการรับชำระเงิน)", os.path.basename(report_name)),
         ("ไฟล์ Master (ยอดขาย/ใบแจ้งหนี้ PJ, V)", os.path.basename(master_name)),
         ("──────────────────────────────", "──────────────────"),
@@ -671,7 +666,7 @@ def create_result_excel(result, report_name, master_name, output_path="match_res
         ("รวมรายการ Report ที่ตรวจเช็คทั้งหมด", result["total_report_pj"]),
         ("──────────────────────────────", "──────────────────"),
         ("4. บิลใน Master ที่ยังไม่มีใน Report", len(result["not_in_report"])),
-        ("รวมบิล Master (PJ, V) ทั้งหมด", result["total_master_pj"]),
+        ("รวมบิล Master ทั้งหมด (ครบทุกแถว)", result["total_master_pj"]),
     ]
 
     for idx, (label, val) in enumerate(summary_rows, start=3):
@@ -881,7 +876,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
 
     date_tag = f" (ข้อมูลวันที่ {matched_date_str})" if matched_date_str else ""
     summary_msg = (
-        f"📊 *รายงานสรุปการจับคู่เอกสาร (PJ, V)*{date_tag}\n"
+        f"📊 *รายงานสรุปการจับคู่เอกสารโดย น้องบิ๊นท์ (PJ, V)*{date_tag}\n"
         f"📅 ประมวลผลเมื่อ: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         f"────────────────────────\n"
         f"📁 *Report:* `{os.path.basename(report_file)}`\n"
@@ -893,7 +888,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
         f"📋 *รวมรายการที่ตรวจเช็ค:* {n_total_report} แถว\n\n"
         f"📌 *บิล Master (PJ/V) ที่ไม่มีใน Report:* {n_not_in_rep} แถว\n"
         f"────────────────────────\n"
-        f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วครับ*"
+        f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วค่ะ*"
     )
 
     print("\n" + summary_msg + "\n")
@@ -906,14 +901,14 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
 
 def start_telegram_listener():
     """โหมดรันเป็น Bot Listener ตลอดเวลา รองรับคำสั่ง 'ตรวจสอบไฟล์' และ 'จับคู่เอกสาร'"""
-    logger.info("🤖 บอท Telegram กำลังออนไลน์และพร้อมรับคำสั่ง...")
+    logger.info("🤖 น้องบิ๊นท์ กำลังออนไลน์และพร้อมรับคำสั่ง...")
     offset = None
 
     send_telegram(
-        "🤖 *บอท Ploy(Accounting) ออนไลน์แล้วครับ!*\n\n"
+        "🤖 *สวัสดีค่ะ น้องบิ๊นท์ พร้อมช่วยตรวจสอบยอดบิลแล้วค่ะ!*\n\n"
         "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
-        "• *ตรวจสอบไฟล์* ➔ เช็คดูว่าใน Google Drive มีไฟล์วันไหนบ้าง และระบบไหนส่งมาแล้วบ้าง\n"
-        "• *จับคู่เอกสาร* ➔ สั่งให้ระบบจับคู่และส่งรายงาน Excel เข้า Telegram ทันที\n"
+        "• *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์เช็คดูว่าใน Google Drive มีไฟล์วันไหนบ้าง และระบบไหนส่งมาแล้วบ้าง\n"
+        "• *จับคู่เอกสาร* ➔ สั่งให้น้องบิ๊นท์จับคู่และส่งรายงาน Excel เข้า Telegram ทันที\n"
         "• *จับคู่เอกสาร [วันที่]* ➔ เจาะจงจับคู่ของวันที่ต้องการ (เช่น `จับคู่เอกสาร 05/11`)",
         chat_id=TELEGRAM_CHAT_ID
     )
@@ -952,7 +947,7 @@ def start_telegram_listener():
 
                 # คำสั่ง: ตรวจสอบไฟล์ (status, check)
                 if any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check")):
-                    send_telegram("⏳ *กำลังตรวจสอบไฟล์ใน Google Drive กรุณารอสักครู่...*", chat_id=chat_id)
+                    send_telegram("⏳ *น้องบิ๊นท์กำลังตรวจสอบไฟล์ใน Google Drive กรุณารอสักครู่นะคะ...*", chat_id=chat_id)
                     try:
                         check_files_status(chat_id=chat_id)
                     except Exception as err:
@@ -967,8 +962,8 @@ def start_telegram_listener():
 
                     date_text = f" ของวันที่ {req_date}" if req_date else ""
                     send_telegram(
-                        f"⏳ *ได้รับคำสั่ง จับคู่เอกสาร{date_text} เรียบร้อยแล้ว!*\n"
-                        "กำลังดาวน์โหลดไฟล์และตรวจสอบความพร้อม กรุณารอสักครู่...",
+                        f"⏳ *น้องบิ๊นท์ได้รับคำสั่ง จับคู่เอกสาร{date_text} เรียบร้อยแล้วค่ะ!*\n"
+                        "กำลังดาวน์โหลดไฟล์และตรวจสอบความพร้อม กรุณารอสักครู่นะคะ...",
                         chat_id=chat_id
                     )
                     try:
@@ -979,11 +974,11 @@ def start_telegram_listener():
 
                 elif text_clean in ("/start", "/help", "help", "คำสั่ง"):
                     send_telegram(
-                        "👋 *สวัสดีครับ! ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V)*\n\n"
+                        "👋 *สวัสดีค่ะ! น้องบิ๊นท์ ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V)*\n\n"
                         "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
-                        "• *ตรวจสอบไฟล์* ➔ ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
-                        "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ (เฉพาะบิล PJ และ V ไม่รวม *V)\n"
-                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 05/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ครับ",
+                        "• *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
+                        "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ (เฉพาะบิล PJ และ V)\n"
+                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 05/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ค่ะ",
                         chat_id=chat_id
                     )
 
