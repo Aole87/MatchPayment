@@ -27,7 +27,7 @@ jobs:
 
     - name: Run Match Bot and Send Telegram
       env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN || '8999661395:AAGMuIUlp0WU4rq5nk_WQs6cOblkB38D270' }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '7603648423' }}
         GDRIVE_FOLDER_URL: ${{ secrets.GDRIVE_FOLDER_URL || 'https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing' }}
         GDRIVE_UPLOAD_URL: ${{ secrets.GDRIVE_UPLOAD_URL }}

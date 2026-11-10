@@ -14,11 +14,28 @@ import xlrd
 import requests
 import gdown
 
-# --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables หรือใช้ค่า Default) ---
+# --- โหลดตัวแปรจากไฟล์ .env (ถ้ามี) สำหรับการรันในเครื่องอย่างปลอดภัย ---
+def load_dotenv(filepath=".env"):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+load_dotenv()
+
+# --- การตั้งค่าคอนฟิก (ดึงค่าจาก Environment Variables) ---
 DEFAULT_DRIVE_FOLDER = "https://drive.google.com/drive/folders/17eSUsgGmTwRexYmyBRSW_OaanuwLYR3g?usp=sharing"
 GDRIVE_FOLDER_URL = (os.environ.get("GDRIVE_FOLDER_URL", "").strip()) or DEFAULT_DRIVE_FOLDER
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8999661395:AAGMuIUlp0WU4rq5nk_WQs6cOblkB38D270").strip()
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7603648423").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
