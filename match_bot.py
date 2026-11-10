@@ -42,6 +42,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+def safe_print(msg):
+    """พิมพ์ข้อความลง stdout อย่างปลอดภัย ไม่ให้ crash ด้วย Errno 5 เมื่อรันเป็น background daemon"""
+    try:
+        sys.stdout.write(str(msg) + "\n")
+        sys.stdout.flush()
+    except (IOError, OSError):
+        pass
+
+
 def download_drive_folder(folder_url=None, output_dir="downloads"):
     """ดาวน์โหลดไฟล์ทั้งหมดจาก Google Drive Folder สาธารณะ"""
     if not folder_url:
@@ -256,7 +265,7 @@ def check_files_status(chat_id=None):
         lines.append("💡 *เมื่ออีกระบบอัปโหลดไฟล์เข้ามาครบแล้ว สามารถพิมพ์ 'จับคู่เอกสาร' ได้ทันทีครับ*")
 
     full_msg = "\n".join(lines)
-    print("\n" + full_msg + "\n")
+    safe_print("\n" + full_msg + "\n")
     send_telegram(full_msg, chat_id=chat_id)
     return full_msg
 
@@ -908,7 +917,7 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
         f"📎 *แนบไฟล์รายงานฉบับสมบูรณ์ `{output_excel}` มาด้วยแล้วค่ะ*"
     )
 
-    print("\n" + summary_msg + "\n")
+    safe_print("\n" + summary_msg + "\n")
 
     # 8. ส่งผลลัพธ์เข้า Telegram
     send_telegram(summary_msg, output_excel, chat_id=target_chat)
