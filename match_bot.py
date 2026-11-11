@@ -52,31 +52,67 @@ def safe_print(msg):
 
 
 def download_drive_folder(folder_url=None, output_dir="downloads"):
-    """ดาวน์โหลดไฟล์ทั้งหมดจาก Google Drive Folder สาธารณะ"""
+    """
+    ดาวน์โหลดและอัปเดตไฟล์ทั้งหมดจาก Google Drive Folder ให้เป็นปัจจุบันเสมอ
+    โดยใช้เทคนิคดึงรายการไฟล์แบบ skip_download ก่อน แล้วดาวน์โหลดทีละไฟล์ด้วย requests/gdown
+    ทำให้มั่นใจได้ว่าไฟล์ใหม่จะถูกดึงลงมาเสมอ และหากมีไฟล์ใดติด permission จะไม่กระทบไฟล์อื่น
+    """
     if not folder_url:
         folder_url = GDRIVE_FOLDER_URL or DEFAULT_DRIVE_FOLDER
     os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"กำลังดาวน์โหลดไฟล์จาก Google Drive: {folder_url}")
+    logger.info(f"กำลังตรวจสอบและดาวน์โหลดไฟล์จาก Google Drive: {folder_url}")
+
+    downloaded_files = []
     try:
-        downloaded = gdown.download_folder(
+        # ดึงรายชื่อไฟล์ทั้งหมดในโฟลเดอร์ Google Drive
+        drive_files = gdown.download_folder(
+            url=folder_url,
+            output=output_dir,
+            skip_download=True,
+            quiet=True
+        )
+        if drive_files:
+            logger.info(f"พบไฟล์ใน Google Drive ทั้งหมด {len(drive_files)} ไฟล์ กำลังตรวจสอบการดาวน์โหลด...")
+            for df in drive_files:
+                out_path = os.path.join(output_dir, df.path)
+                try:
+                    # ดาวน์โหลดโดยตรงผ่าน endpoint uc
+                    dl_url = f"https://drive.google.com/uc?id={df.id}&export=download"
+                    res = requests.get(dl_url, allow_redirects=True, timeout=60)
+                    if res.status_code == 200 and len(res.content) > 500:
+                        # ตรวจสอบว่าเป็นไฟล์ Excel จริง (XLS หรือ XLSX)
+                        if res.content.startswith(b"\xd0\xcf\x11\xe0") or res.content.startswith(b"PK"):
+                            with open(out_path, "wb") as f:
+                                f.write(res.content)
+                            downloaded_files.append(out_path)
+                            logger.info(f"✅ ดาวน์โหลดสำเร็จ: {df.path} ({len(res.content)} bytes)")
+                            continue
+
+                    # ถ้า direct request ไม่ได้ไฟล์ Excel ให้ลองใช้ gdown.download
+                    logger.info(f"ลองดาวน์โหลด {df.path} ผ่าน gdown.download...")
+                    dl_res = gdown.download(id=df.id, output=out_path, quiet=True)
+                    if dl_res:
+                        downloaded_files.append(out_path)
+                        logger.info(f"✅ gdown สำเร็จ: {df.path}")
+                except Exception as file_err:
+                    logger.warning(f"⚠️ ไม่สามารถดาวน์โหลดไฟล์ {df.path} ได้: {file_err}")
+            return output_dir
+    except Exception as list_err:
+        logger.warning(f"ไม่สามารถดึงรายชื่อไฟล์ด้วย skip_download ได้: {list_err}, กำลังลองแบบ fallback...")
+
+    # Fallback กรณี skip_download มีปัญหา
+    try:
+        gdown.download_folder(
             url=folder_url,
             output=output_dir,
             quiet=False,
-            use_cookies=False
+            use_cookies=False,
+            remaining_ok=True
         )
-        logger.info(f"ดาวน์โหลดสำเร็จ ได้รับไฟล์: {downloaded}")
-        return output_dir
     except Exception as e:
-        logger.warning(f"gdown.download_folder API error: {e}, กำลังลองด้วย gdown CLI...")
-        try:
-            import subprocess
-            cmd = [sys.executable, "-m", "gdown", "--folder", folder_url, "-O", output_dir]
-            logger.info(f"รันคำสั่ง CLI: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True)
-            return output_dir
-        except Exception as e2:
-            logger.error(f"เกิดข้อผิดพลาดในการดาวน์โหลดด้วย gdown CLI: {e2}")
-            return output_dir
+        logger.error(f"Fallback gdown.download_folder error: {e}")
+
+    return output_dir
 
 
 class MissingPairError(Exception):
@@ -222,7 +258,7 @@ def check_files_status(chat_id=None):
     date_groups = scan_and_group_files([download_dir, "."])
 
     if not date_groups:
-        msg = "⚠️ *ไม่พบไฟล์ Excel ในระบบเลยครับ* กรุณาอัปโหลดไฟล์เข้า Google Drive"
+        msg = "⚠️ *ไม่พบไฟล์ Excel ในระบบเลยค่ะ* กรุณาอัปโหลดไฟล์เข้า Google Drive"
         send_telegram(msg, chat_id=chat_id)
         return msg
 
@@ -260,9 +296,9 @@ def check_files_status(chat_id=None):
 
     lines.append("────────────────────────")
     if has_ready:
-        lines.append("💡 *พิมพ์คำว่า 'จับคู่เอกสาร' เพื่อเริ่มประมวลผลได้ทันทีครับ*")
+        lines.append("💡 *พิมพ์คำว่า 'จับคู่เอกสาร' เพื่อเริ่มประมวลผลได้ทันทีค่ะ*")
     else:
-        lines.append("💡 *เมื่ออีกระบบอัปโหลดไฟล์เข้ามาครบแล้ว สามารถพิมพ์ 'จับคู่เอกสาร' ได้ทันทีครับ*")
+        lines.append("💡 *เมื่ออีกระบบอัปโหลดไฟล์เข้ามาครบแล้ว สามารถพิมพ์ 'จับคู่เอกสาร' ได้ทันทีค่ะ*")
 
     full_msg = "\n".join(lines)
     safe_print("\n" + full_msg + "\n")
