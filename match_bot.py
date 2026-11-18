@@ -306,10 +306,56 @@ def check_files_status(chat_id=None):
     return full_msg
 
 
+def resolve_target_date(target_str, available_keys):
+    """
+    จับคู่วันที่จากข้อความที่ผู้ใช้ส่งมาให้ตรงกับ key วันที่ที่มีในระบบอย่างแม่นยำ:
+    - รองรับข้อความที่มี key ตรงๆ เช่น '10-16/11'
+    - รองรับวันที่แบบช่วง เช่น '10-16/11', '10-16', '6-8/11', '6-8'
+    - รองรับวันที่เดี่ยว เช่น '16-11', '16/11', '09/11', '9-11'
+    - หากระบุวันเดี่ยวที่อยู่ในช่วงวัน (เช่น '16' หรือ '16-11') จะจับคู่กับ key ช่วงวัน ('10-16/11') ให้อัตโนมัติ
+    """
+    if not target_str or not available_keys:
+        return None
+
+    # 1. เช็คว่ามี key ใดใน available_keys ปรากฏในข้อความตรงๆ หรือไม่
+    for k in available_keys:
+        if k in target_str:
+            return k
+
+    # 2. เช็ค pattern วันที่แบบช่วง เช่น 10-16/11 หรือ 6-8/11
+    m_range = re.search(r'(\d{1,2})\s*[-~]\s*(\d{1,2})[/-](\d{1,2})', target_str)
+    if m_range:
+        d1, d2, m = int(m_range.group(1)), int(m_range.group(2)), int(m_range.group(3))
+        cand = f"{d1:02d}-{d2:02d}/{m:02d}"
+        if cand in available_keys:
+            return cand
+        cand_short = f"{d1}-{d2}/{m:02d}"
+        for k in available_keys:
+            if cand == k or cand_short == k:
+                return k
+
+    # 3. เช็ค pattern วันที่เดี่ยว เช่น 09/11, 9-11, 16-11, 16/11
+    m_single = re.search(r'(\d{1,2})[/-](\d{1,2})', target_str)
+    if m_single:
+        d, m = int(m_single.group(1)), int(m_single.group(2))
+        cand = f"{d:02d}/{m:02d}"
+        if cand in available_keys:
+            return cand
+        # ตรวจสอบว่าวัน d และเดือน m ตกอยู่ในช่วงวันของ key ไหนหรือไม่ (เช่น 16/11 อยู่ใน 10-16/11)
+        for k in available_keys:
+            mr = re.match(r'(\d{1,2})-(\d{1,2})/(\d{1,2})', k)
+            if mr:
+                kd1, kd2, km = int(mr.group(1)), int(mr.group(2)), int(mr.group(3))
+                if km == m and kd1 <= d <= kd2:
+                    return k
+
+    return None
+
+
 def find_target_files(search_dirs=None, target_date=None):
     """
     ค้นหาคู่ไฟล์ที่ตรงกันตาม 'วันที่ของข้อมูล' อย่างปลอดภัย:
-    1. หากระบุ target_date (เช่น '05/11') -> ดึงคู่วันที่นั้น
+    1. หากระบุ target_date (เช่น '10-16/11', '05/11') -> ดึงคู่วันที่นั้น
     2. หากไม่ระบุ -> ดึงวันที่ล่าสุดที่สมบูรณ์ทั้ง 2 ฝั่ง
        หากวันล่าสุดยังมีไฟล์แค่ระบบเดียว จะแจ้งเตือนให้รออย่างชัดเจน
     """
@@ -320,10 +366,8 @@ def find_target_files(search_dirs=None, target_date=None):
 
     # กรณีระบุวันที่เจาะจง
     if target_date:
-        m_t = re.search(r"(\d{1,2})[/-](\d{1,2})", target_date)
-        if m_t:
-            norm_date = f"{int(m_t.group(1)):02d}/{int(m_t.group(2)):02d}"
-        else:
+        norm_date = resolve_target_date(target_date, list(date_groups.keys()))
+        if not norm_date:
             norm_date = target_date
 
         if norm_date not in date_groups:
@@ -352,11 +396,11 @@ def find_target_files(search_dirs=None, target_date=None):
 
     # ตรวจสอบดูว่ามีวันก่อนหน้าที่มีไฟล์ครบหรือไม่
     ready_dates = [d for d, inf in date_groups.items() if inf["report"] and inf["master"]]
-    ready_hint = f"\n*(💡 วันที่พร้อมจับคู่ตอนนี้คือ {ready_dates[0]} สามารถพิมพ์ 'จับคู่เอกสาร {ready_dates[0]}' ได้ครับ)*" if ready_dates else ""
+    ready_hint = f"\n*(💡 วันที่พร้อมจับคู่ตอนนี้คือ {ready_dates[0]} สามารถพิมพ์ 'จับคู่เอกสาร {ready_dates[0]}' ได้ค่ะ)*" if ready_dates else ""
 
     err_msg = (
         f"พบไฟล์ {present} วันที่ {latest_date} (`{present_file}`) แล้ว\n"
-        f"แต่ยังขาดไฟล์ {missing} ของวันที่ {latest_date} ครับ\n"
+        f"แต่ยังขาดไฟล์ {missing} ของวันที่ {latest_date} ค่ะ\n"
         f"⏳ กรุณารออีกระบบอัปโหลดไฟล์ {missing} แล้วส่งคำสั่ง 'จับคู่เอกสาร' อีกครั้ง{ready_hint}"
     )
     raise MissingPairError(err_msg)
@@ -1018,11 +1062,11 @@ def start_telegram_listener():
 
                 # คำสั่ง: จับคู่เอกสาร (match data, match)
                 elif any(k in text_clean for k in ("จับคู่เอกสาร", "จับคู่ข้อมูล", "จับคู่", "match data", "matchdata", "match", "/match")):
-                    # ตรวจสอบว่ามีการระบุวันที่หรือไม่ เช่น "จับคู่เอกสาร 05/11" หรือ "จับคู่ 5-11"
-                    m_d = re.search(r"(\d{1,2})[/-](\d{1,2})", text)
-                    req_date = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}" if m_d else None
+                    # ตรวจสอบว่ามีการระบุวันที่หรือไม่ (รองรับทั้งช่วงวัน 10-16/11, วันเดี่ยว 16/11, 09/11 และการ forward/copy บล็อกสถานะ)
+                    temp_groups = scan_and_group_files()
+                    req_date = resolve_target_date(text, list(temp_groups.keys()))
 
-                    date_text = f" ของวันที่ {req_date}" if req_date else ""
+                    date_text = f" ของวันที่ {req_date}" if req_date else " (รอบล่าสุด)"
                     send_telegram(
                         f"⏳ *น้องบิ๊นท์ได้รับคำสั่ง จับคู่เอกสาร{date_text} เรียบร้อยแล้วค่ะ!*\n"
                         "กำลังดาวน์โหลดไฟล์และตรวจสอบความพร้อม กรุณารอสักครู่นะคะ...",
@@ -1063,9 +1107,8 @@ def main():
         mast_file = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") and os.path.exists(sys.argv[2]) else None
         target_d = None
         for arg in sys.argv[1:]:
-            m_d = re.search(r"^(\d{1,2})[/-](\d{1,2})$", arg)
-            if m_d:
-                target_d = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}"
+            if not arg.startswith("-") and not os.path.exists(arg):
+                target_d = arg
                 break
         run_matching_job(report_file=rep_file, master_file=mast_file, target_date=target_d)
 
