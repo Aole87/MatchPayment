@@ -96,6 +96,19 @@ def download_drive_folder(folder_url=None, output_dir="downloads"):
                         logger.info(f"✅ gdown สำเร็จ: {df.path}")
                 except Exception as file_err:
                     logger.warning(f"⚠️ ไม่สามารถดาวน์โหลดไฟล์ {df.path} ได้: {file_err}")
+
+            # ทำความสะอาดไฟล์ใน downloads ที่ถูกเปลี่ยนชื่อหรือลบไปแล้วจาก Google Drive
+            valid_names = set(df.path for df in drive_files)
+            for existing_f in os.listdir(output_dir):
+                if existing_f.lower().endswith((".xls", ".xlsx")) and not existing_f.startswith("~$") and not existing_f.startswith("match_result"):
+                    if existing_f not in valid_names:
+                        old_fp = os.path.join(output_dir, existing_f)
+                        try:
+                            os.remove(old_fp)
+                            logger.info(f"🗑️ ลบไฟล์เก่าที่ไม่มีใน Google Drive แล้ว: {existing_f}")
+                        except Exception:
+                            pass
+
             return output_dir
     except Exception as list_err:
         logger.warning(f"ไม่สามารถดึงรายชื่อไฟล์ด้วย skip_download ได้: {list_err}, กำลังลองแบบ fallback...")
@@ -306,23 +319,33 @@ def check_files_status(chat_id=None):
     return full_msg
 
 
-def resolve_target_date(target_str, available_keys):
+def resolve_target_date(target_str, date_groups_dict):
     """
     จับคู่วันที่จากข้อความที่ผู้ใช้ส่งมาให้ตรงกับ key วันที่ที่มีในระบบอย่างแม่นยำ:
-    - รองรับข้อความที่มี key ตรงๆ เช่น '10-16/11'
-    - รองรับวันที่แบบช่วง เช่น '10-16/11', '10-16', '6-8/11', '6-8'
-    - รองรับวันที่เดี่ยว เช่น '16-11', '16/11', '09/11', '9-11'
-    - หากระบุวันเดี่ยวที่อยู่ในช่วงวัน (เช่น '16' หรือ '16-11') จะจับคู่กับ key ช่วงวัน ('10-16/11') ให้อัตโนมัติ
+    - รองรับข้อความที่มี key ตรงๆ เช่น '10-16/11', '17-19/11'
+    - รองรับวันที่แบบช่วง เช่น '17-19/11', '17-19', '10-16/11', '10-16', '6-8/11', '6-8'
+    - รองรับวันที่เดี่ยว เช่น '20-11', '20/11', '19-11', '19/11', '16-11', '16/11', '09/11'
+    - หากระบุวันเดี่ยวหรือวันที่ในชื่อไฟล์ (เช่น '20-11', '20/11' ที่มาจาก 20-11.xls หรือ Report_20261120)
+      จะจับคู่กับกลุ่มวันที่ของไฟล์นั้นให้อัตโนมัติ
     """
-    if not target_str or not available_keys:
+    if not target_str or not date_groups_dict:
         return None
+
+    if isinstance(date_groups_dict, dict):
+        available_keys = list(date_groups_dict.keys())
+        groups_map = date_groups_dict
+    else:
+        available_keys = list(date_groups_dict)
+        groups_map = {}
+
+    target_str = str(target_str).strip()
 
     # 1. เช็คว่ามี key ใดใน available_keys ปรากฏในข้อความตรงๆ หรือไม่
     for k in available_keys:
         if k in target_str:
             return k
 
-    # 2. เช็ค pattern วันที่แบบช่วง เช่น 10-16/11 หรือ 6-8/11
+    # 2. เช็ค pattern วันที่แบบช่วงมีเดือน เช่น 10-16/11 หรือ 17-19/11 หรือ 6-8/11
     m_range = re.search(r'(\d{1,2})\s*[-~]\s*(\d{1,2})[/-](\d{1,2})', target_str)
     if m_range:
         d1, d2, m = int(m_range.group(1)), int(m_range.group(2)), int(m_range.group(3))
@@ -334,19 +357,52 @@ def resolve_target_date(target_str, available_keys):
             if cand == k or cand_short == k:
                 return k
 
-    # 3. เช็ค pattern วันที่เดี่ยว เช่น 09/11, 9-11, 16-11, 16/11
+    # 3. เช็ค pattern วันที่แบบช่วงไม่มีเดือน เช่น 17-19 หรือ 10-16 หรือ 6-8
+    m_range_no_m = re.search(r'(\d{1,2})\s*[-~]\s*(\d{1,2})', target_str)
+    if m_range_no_m:
+        d1, d2 = int(m_range_no_m.group(1)), int(m_range_no_m.group(2))
+        for k in available_keys:
+            mr = re.match(r'(\d{1,2})-(\d{1,2})/(\d{1,2})', k)
+            if mr:
+                kd1, kd2 = int(mr.group(1)), int(mr.group(2))
+                if (d1 == kd1 and d2 == kd2) or (d1 <= kd1 and d2 >= kd2):
+                    return k
+
+    # 4. เช็ค pattern วันที่เดี่ยว เช่น 20/11, 20-11, 19/11, 19-11, 09/11, 9-11
     m_single = re.search(r'(\d{1,2})[/-](\d{1,2})', target_str)
     if m_single:
         d, m = int(m_single.group(1)), int(m_single.group(2))
         cand = f"{d:02d}/{m:02d}"
         if cand in available_keys:
             return cand
-        # ตรวจสอบว่าวัน d และเดือน m ตกอยู่ในช่วงวันของ key ไหนหรือไม่ (เช่น 16/11 อยู่ใน 10-16/11)
+        # ตรวจสอบว่าวัน d และเดือน m ตกอยู่ในช่วงวันของ key ไหนหรือไม่ (เช่น 19/11 อยู่ใน 17-19/11)
         for k in available_keys:
             mr = re.match(r'(\d{1,2})-(\d{1,2})/(\d{1,2})', k)
             if mr:
                 kd1, kd2, km = int(mr.group(1)), int(mr.group(2)), int(mr.group(3))
                 if km == m and kd1 <= d <= kd2:
+                    return k
+        # ตรวจสอบกับชื่อไฟล์ master หรือ report ในกลุ่ม (เช่น 20-11.xls หรือ Report_20261120)
+        t_dash = f"{d}-{m}"
+        t_zero = f"{d:02d}-{m:02d}"
+        t_ymd = f"{m:02d}{d:02d}"
+        for k, info in groups_map.items():
+            if isinstance(info, dict):
+                fn_m = os.path.basename(info.get("master") or "")
+                fn_r = os.path.basename(info.get("report") or "")
+                combined = f"{fn_m} {fn_r}".lower()
+                if t_dash in combined or t_zero in combined or t_ymd in combined:
+                    return k
+
+    # 5. เช็คตัวเลขวันโดดๆ เช่น 20 หรือ 19
+    m_num = re.search(r'\b(\d{1,2})\b', target_str)
+    if m_num:
+        num = int(m_num.group(1))
+        for k, info in groups_map.items():
+            if isinstance(info, dict):
+                fn_m = os.path.basename(info.get("master") or "")
+                fn_r = os.path.basename(info.get("report") or "")
+                if f"{num}-" in fn_m or f"{num:02d}-" in fn_m or f"{num:02d}" in fn_r:
                     return k
 
     return None
@@ -355,7 +411,7 @@ def resolve_target_date(target_str, available_keys):
 def find_target_files(search_dirs=None, target_date=None):
     """
     ค้นหาคู่ไฟล์ที่ตรงกันตาม 'วันที่ของข้อมูล' อย่างปลอดภัย:
-    1. หากระบุ target_date (เช่น '10-16/11', '05/11') -> ดึงคู่วันที่นั้น
+    1. หากระบุ target_date (เช่น '17-19/11', '20-11', '05/11') -> ดึงคู่วันที่นั้น
     2. หากไม่ระบุ -> ดึงวันที่ล่าสุดที่สมบูรณ์ทั้ง 2 ฝั่ง
        หากวันล่าสุดยังมีไฟล์แค่ระบบเดียว จะแจ้งเตือนให้รออย่างชัดเจน
     """
@@ -366,7 +422,7 @@ def find_target_files(search_dirs=None, target_date=None):
 
     # กรณีระบุวันที่เจาะจง
     if target_date:
-        norm_date = resolve_target_date(target_date, list(date_groups.keys()))
+        norm_date = resolve_target_date(target_date, date_groups)
         if not norm_date:
             norm_date = target_date
 
@@ -1051,8 +1107,8 @@ def start_telegram_listener():
                 logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
                 text_clean = text.lower().strip()
 
-                # คำสั่ง: ตรวจสอบไฟล์ (status, check)
-                if any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check")):
+                # คำสั่ง: ตรวจสอบไฟล์ (status, check, update, อัปเดต, ไฟล์ใหม่, ฯลฯ)
+                if any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check", "update", "อัปเดต", "อัพเดต", "ไฟล์ใหม่", "ดูไฟล์", "มีไฟล์")):
                     send_telegram("⏳ *น้องบิ๊นท์กำลังตรวจสอบไฟล์ใน Google Drive กรุณารอสักครู่นะคะ...*", chat_id=chat_id)
                     try:
                         check_files_status(chat_id=chat_id)
@@ -1062,9 +1118,9 @@ def start_telegram_listener():
 
                 # คำสั่ง: จับคู่เอกสาร (match data, match)
                 elif any(k in text_clean for k in ("จับคู่เอกสาร", "จับคู่ข้อมูล", "จับคู่", "match data", "matchdata", "match", "/match")):
-                    # ตรวจสอบว่ามีการระบุวันที่หรือไม่ (รองรับทั้งช่วงวัน 10-16/11, วันเดี่ยว 16/11, 09/11 และการ forward/copy บล็อกสถานะ)
+                    # ตรวจสอบว่ามีการระบุวันที่หรือไม่ (รองรับทั้งช่วงวัน 17-19/11, วันเดี่ยว 20/11, 19/11, 16/11 และการ forward/copy บล็อกสถานะ)
                     temp_groups = scan_and_group_files()
-                    req_date = resolve_target_date(text, list(temp_groups.keys()))
+                    req_date = resolve_target_date(text, temp_groups)
 
                     date_text = f" ของวันที่ {req_date}" if req_date else " (รอบล่าสุด)"
                     send_telegram(
@@ -1078,13 +1134,22 @@ def start_telegram_listener():
                         logger.error(f"เกิดข้อผิดพลาดในการประมวลผล: {err}", exc_info=True)
                         send_telegram(f"❌ *เกิดข้อผิดพลาดในการประมวลผล:*\n`{str(err)}`", chat_id=chat_id)
 
-                elif text_clean in ("/start", "/help", "help", "คำสั่ง"):
+                elif text_clean in ("/start", "/help", "help", "คำสั่ง", "เมนู", "menu"):
                     send_telegram(
                         "👋 *สวัสดีค่ะ! น้องบิ๊นท์ ยินดีต้อนรับสู่ระบบตรวจยอดบิล (PJ, V)*\n\n"
                         "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
                         "• *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
                         "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ (เฉพาะบิล PJ และ V)\n"
-                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 05/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ค่ะ",
+                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 20-11` หรือ `จับคู่ 17-19/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ค่ะ",
+                        chat_id=chat_id
+                    )
+
+                else:
+                    send_telegram(
+                        "👋 *สวัสดีค่ะ น้องบิ๊นท์ ได้รับข้อความแล้วค่ะ*\n\n"
+                        "💡 *สามารถสั่งงานได้ดังนี้เลยนะคะ:*\n"
+                        "• พิมพ์ *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์ตรวจเช็คไฟล์ล่าสุดใน Google Drive\n"
+                        "• พิมพ์ *จับคู่เอกสาร* ➔ ทำการตรวจสอบและสรุปยอดบิลส่งไฟล์ Excel ให้ทันทีค่ะ",
                         chat_id=chat_id
                     )
 
