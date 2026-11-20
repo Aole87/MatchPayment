@@ -408,6 +408,66 @@ def resolve_target_date(target_str, date_groups_dict):
     return None
 
 
+def extract_two_files_from_text(text, search_dirs=None):
+    """
+    ดึงคู่ไฟล์ 2 ไฟล์จากข้อความที่ผู้ใช้พิมพ์ใน Telegram โดยตรง
+    เช่น 'จับคู่ 20-11.xls Report_20261120_103902.xlsx' หรือ '20-11.xls กับ Report_20261120_103902.xlsx'
+    คืนค่าเป็น (report_file_path, master_file_path) หรือ None
+    """
+    if not text:
+        return None
+
+    if search_dirs is None:
+        search_dirs = ["downloads", "."] if os.path.exists("downloads") else ["."]
+
+    all_files = []
+    for d in search_dirs:
+        if os.path.exists(d):
+            for f in os.listdir(d):
+                if f.lower().endswith((".xls", ".xlsx")) and not f.startswith("~$") and not f.startswith("match_result"):
+                    all_files.append(os.path.join(d, f))
+
+    # เรียงจากชื่อไฟล์ที่ยาวที่สุดไปสั้น เพื่อไม่ให้ substring สับสน (เช่น 6-11.xls ไปชนกับ 16-11.xls)
+    all_files.sort(key=lambda x: len(os.path.basename(x)), reverse=True)
+
+    found = []
+    text_remaining = text
+
+    # 1. ค้นหาชื่อไฟล์แบบเต็ม (รวมนามสกุล เช่น 20-11.xls, Report_20261120_103902.xlsx)
+    for fp in all_files:
+        bn = os.path.basename(fp)
+        pattern = r"(?<![0-9a-zA-Z_])" + re.escape(bn) + r"(?![0-9a-zA-Z_])"
+        if re.search(pattern, text_remaining, re.IGNORECASE):
+            found.append(fp)
+            text_remaining = re.sub(pattern, " ", text_remaining, flags=re.IGNORECASE)
+
+    # 2. ค้นหาชื่อไฟล์แบบตัดนามสกุลออก (เช่น 20-11, Report_20261120_103902)
+    if len(found) < 2:
+        for fp in all_files:
+            if fp in found:
+                continue
+            bn_no_ext = os.path.splitext(os.path.basename(fp))[0]
+            if len(bn_no_ext) >= 3:
+                pattern = r"(?<![0-9a-zA-Z_])" + re.escape(bn_no_ext) + r"(?![0-9a-zA-Z_])"
+                if re.search(pattern, text_remaining, re.IGNORECASE):
+                    found.append(fp)
+                    text_remaining = re.sub(pattern, " ", text_remaining, flags=re.IGNORECASE)
+
+    # 3. หากพบครบ 2 ไฟล์ ให้แยกแยะว่าไฟล์ไหนคือ Report และไฟล์ไหนคือ Master
+    if len(found) == 2:
+        f1, f2 = found[0], found[1]
+        is_rep1 = "report" in os.path.basename(f1).lower()
+        is_rep2 = "report" in os.path.basename(f2).lower()
+        if is_rep1 and not is_rep2:
+            return f1, f2
+        elif is_rep2 and not is_rep1:
+            return f2, f1
+        else:
+            return f1, f2
+
+    return None
+
+
 def find_target_files(search_dirs=None, target_date=None):
     """
     ค้นหาคู่ไฟล์ที่ตรงกันตาม 'วันที่ของข้อมูล' อย่างปลอดภัย:
@@ -1107,8 +1167,32 @@ def start_telegram_listener():
                 logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
                 text_clean = text.lower().strip()
 
-                # คำสั่ง: ตรวจสอบไฟล์ (status, check, update, อัปเดต, ไฟล์ใหม่, ฯลฯ)
-                if any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check", "update", "อัปเดต", "อัพเดต", "ไฟล์ใหม่", "ดูไฟล์", "มีไฟล์")):
+                # 1. ตรวจสอบว่าผู้ใช้พิมพ์ระบุชื่อไฟล์ 2 ไฟล์โดยตรงหรือไม่ (เช่น "จับคู่ 20-11.xls Report_20261120_103902.xlsx")
+                file_pair = extract_two_files_from_text(text)
+                if not file_pair and (".xls" in text_clean or "report" in text_clean):
+                    # ถ้าพบคำว่า .xls หรือ report ในข้อความแต่ยังหาไฟล์ในเครื่องไม่เจอ ให้ดาวน์โหลดไฟล์จาก Google Drive ก่อนแล้วค้นหาอีกครั้ง
+                    download_drive_folder()
+                    file_pair = extract_two_files_from_text(text)
+
+                if file_pair:
+                    rep_f, mast_f = file_pair
+                    rep_name = os.path.basename(rep_f)
+                    mast_name = os.path.basename(mast_f)
+                    send_telegram(
+                        f"⏳ *น้องบิ๊นท์ได้รับคำสั่ง จับคู่ไฟล์ตามที่ระบุเรียบร้อยแล้วค่ะ!*\n"
+                        f"📁 *Report:* `{rep_name}`\n"
+                        f"📁 *Master:* `{mast_name}`\n\n"
+                        f"กำลังประมวลผล กรุณารอสักครู่นะคะ...",
+                        chat_id=chat_id
+                    )
+                    try:
+                        run_matching_job(report_file=rep_f, master_file=mast_f, chat_id=chat_id)
+                    except Exception as err:
+                        logger.error(f"เกิดข้อผิดพลาดในการประมวลผล: {err}", exc_info=True)
+                        send_telegram(f"❌ *เกิดข้อผิดพลาดในการประมวลผล:*\n`{str(err)}`", chat_id=chat_id)
+
+                # 2. คำสั่ง: ตรวจสอบไฟล์ (status, check, update, อัปเดต, ไฟล์ใหม่, ฯลฯ)
+                elif any(k in text_clean for k in ("ตรวจสอบไฟล์", "ตรวจไฟล์", "เช็คไฟล์", "status", "check", "update", "อัปเดต", "อัพเดต", "ไฟล์ใหม่", "ดูไฟล์", "มีไฟล์")):
                     send_telegram("⏳ *น้องบิ๊นท์กำลังตรวจสอบไฟล์ใน Google Drive กรุณารอสักครู่นะคะ...*", chat_id=chat_id)
                     try:
                         check_files_status(chat_id=chat_id)
@@ -1116,7 +1200,7 @@ def start_telegram_listener():
                         logger.error(f"เกิดข้อผิดพลาดในการตรวจสอบไฟล์: {err}", exc_info=True)
                         send_telegram(f"❌ *เกิดข้อผิดพลาดในการตรวจสอบไฟล์:*\n`{str(err)}`", chat_id=chat_id)
 
-                # คำสั่ง: จับคู่เอกสาร (match data, match)
+                # 3. คำสั่ง: จับคู่เอกสาร (match data, match)
                 elif any(k in text_clean for k in ("จับคู่เอกสาร", "จับคู่ข้อมูล", "จับคู่", "match data", "matchdata", "match", "/match")):
                     # ตรวจสอบว่ามีการระบุวันที่หรือไม่ (รองรับทั้งช่วงวัน 17-19/11, วันเดี่ยว 20/11, 19/11, 16/11 และการ forward/copy บล็อกสถานะ)
                     temp_groups = scan_and_group_files()
@@ -1140,7 +1224,8 @@ def start_telegram_listener():
                         "💡 *คำสั่งภาษาไทยที่รองรับ:*\n"
                         "• *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์ตรวจเช็คว่าใน Google Drive มีไฟล์วันไหนเข้ามาบ้าง และคู่ไหนพร้อมจับคู่แล้ว\n"
                         "• *จับคู่เอกสาร* ➔ เริ่มการตรวจสอบและจับคู่ข้อมูลยอดขายอัตโนมัติ (เฉพาะบิล PJ และ V)\n"
-                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 20-11` หรือ `จับคู่ 17-19/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ค่ะ",
+                        "• *จับคู่เอกสาร [วันที่]* (เช่น `จับคู่เอกสาร 20-11` หรือ `จับคู่ 17-19/11`) ➔ ระบุวันที่ที่ต้องการจับคู่ได้ค่ะ\n"
+                        "• *พิมพ์ชื่อ 2 ไฟล์ที่ต้องการจับคู่* (เช่น `จับคู่ 20-11.xls Report_20261120_103902.xlsx` หรือ `20-11.xls กับ Report_20261120_103902.xlsx`) ➔ เลือกจับคู่ 2 ไฟล์ที่ต้องการได้ทันทีค่ะ",
                         chat_id=chat_id
                     )
 
@@ -1149,7 +1234,8 @@ def start_telegram_listener():
                         "👋 *สวัสดีค่ะ น้องบิ๊นท์ ได้รับข้อความแล้วค่ะ*\n\n"
                         "💡 *สามารถสั่งงานได้ดังนี้เลยนะคะ:*\n"
                         "• พิมพ์ *ตรวจสอบไฟล์* ➔ ให้น้องบิ๊นท์ตรวจเช็คไฟล์ล่าสุดใน Google Drive\n"
-                        "• พิมพ์ *จับคู่เอกสาร* ➔ ทำการตรวจสอบและสรุปยอดบิลส่งไฟล์ Excel ให้ทันทีค่ะ",
+                        "• พิมพ์ *จับคู่เอกสาร* ➔ ทำการตรวจสอบและสรุปยอดบิลส่งไฟล์ Excel ให้ทันทีค่ะ\n"
+                        "• พิมพ์ *ชื่อ 2 ไฟล์* (เช่น `20-11.xls Report_20261120_103902.xlsx`) ➔ เลือกจับคู่ 2 ไฟล์ที่ต้องการได้ทันทีค่ะ",
                         chat_id=chat_id
                     )
 
