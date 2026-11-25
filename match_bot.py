@@ -1121,8 +1121,38 @@ def run_matching_job(report_file=None, master_file=None, chat_id=None, target_da
     return result
 
 
+def send_chat_action(chat_id, action="typing"):
+    """ส่งสัญญาณสถานะกำลังพิมพ์ใน Telegram ให้ผู้ใช้ทราบทันทีว่าบอทกำลังประมวลผล"""
+    if not TELEGRAM_TOKEN or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendChatAction",
+            data={"chat_id": str(chat_id), "action": action},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
+def acquire_single_instance_lock():
+    """ป้องกันไม่ให้เปิด bot listener ซ้อนกันหลาย process ซึ่งจะทำให้ getUpdates ชนกันและข้อความหาย"""
+    import fcntl
+    lock_file = "/tmp/match_bot_listener.lock"
+    try:
+        f = open(lock_file, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        f.write(str(os.getpid()))
+        f.flush()
+        return f
+    except (IOError, BlockingIOError):
+        logger.warning("⚠️ มี process bot listener ตัวอื่นกำลังทำงานอยู่แล้ว! ปิดตัวลงเพื่อไม่ให้แย่งรับข้อความ Telegram")
+        sys.exit(0)
+
+
 def start_telegram_listener():
     """โหมดรันเป็น Bot Listener ตลอดเวลา รองรับคำสั่ง 'ตรวจสอบไฟล์' และ 'จับคู่เอกสาร'"""
+    _lock = acquire_single_instance_lock()
     logger.info("🤖 น้องบิ๊นท์ กำลังออนไลน์และพร้อมรับคำสั่ง...")
     offset = None
 
@@ -1166,6 +1196,7 @@ def start_telegram_listener():
 
                 logger.info(f"ได้รับข้อความจาก Chat ID {chat_id}: '{text}'")
                 text_clean = text.lower().strip()
+                send_chat_action(chat_id, "typing")
 
                 # 1. ตรวจสอบว่าผู้ใช้พิมพ์ระบุชื่อไฟล์ 2 ไฟล์โดยตรงหรือไม่ (เช่น "จับคู่ 20-11.xls Report_20261120_103902.xlsx")
                 file_pair = extract_two_files_from_text(text)
